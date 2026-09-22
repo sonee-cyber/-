@@ -64,7 +64,7 @@ async def report(m: types.Message):
         prompt = f"Ты автоэксперт-перекуп. Авто: {desc}. Проанализируй фото, дай: кузов, салон, косяки, что спросить, рыночная цена, вердикт БРАТЬ/НЕ БРАТЬ. Пиши коротко по-пацански на русском."
 
         resp = await client.chat.completions.create(
-            model="meta-llama/llama-3.2-11b-vision-instruct:free",
+            model="openai/gpt-4o-mini",
             messages=[{"role": "user", "content": [{"type": "text", "text": prompt}] + imgs}]
         )
         answer = resp.choices[0].message.content
