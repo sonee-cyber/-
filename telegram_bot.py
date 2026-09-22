@@ -7,6 +7,8 @@ from openai import AsyncOpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OR_KEY = os.getenv("OPENAI_API_KEY")
 
+print(f"KEY EXISTS: {bool(OR_KEY)}") # для логов Railway
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1") if OR_KEY else None
@@ -17,7 +19,7 @@ user_data = {}
 async def start(m: types.Message):
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚗 Оценить авто")]], resize_keyboard=True)
     user_data[m.from_user.id] = {"photos": [], "desc": ""}
-    await m.answer("Готово! Я теперь вижу авто 👀\nКидай до 12 фото ЛЮБОЙ тачки + напиши модель/цену если есть.\nПотом жми 🚗 Оценить авто - разберу как эксперт.", reply_markup=kb)
+    await m.answer(f"Бот перезапущен! Ключ подключен: {bool(OR_KEY)} ✅\nКидай фото до 12 штук и жми 🚗 Оценить авто", reply_markup=kb)
 
 @dp.message(F.photo)
 async def handle_photo(m: types.Message):
@@ -26,8 +28,7 @@ async def handle_photo(m: types.Message):
     if m.caption:
         user_data[uid]["desc"] = m.caption
     user_data[uid]["photos"].append(m.photo[-1].file_id)
-    c = len(user_data[uid]["photos"])
-    await m.answer(f"Фото принял ✅ {c}/12")
+    await m.answer(f"Фото принял ✅ {len(user_data[uid]['photos'])}/12")
 
 @dp.message(F.text & ~F.text.contains("Оценить"))
 async def save_desc(m: types.Message):
@@ -35,15 +36,17 @@ async def save_desc(m: types.Message):
     uid = m.from_user.id
     if uid not in user_data: user_data[uid] = {"photos": [], "desc": ""}
     user_data[uid]["desc"] += " " + m.text
-    await m.answer(f"Запомнил: {m.text}")
 
 @dp.message(F.text.contains("Оценить"))
 async def report(m: types.Message):
     uid = m.from_user.id
     data = user_data.get(uid, {"photos": [], "desc": ""})
     photos = data["photos"]
-    desc = data["desc"]
+    desc = data["desc"] or "авто с фото"
 
+    if not OR_KEY or not client:
+        await m.answer("❌ Ключ не подключен! Иди в Railway -> Variables -> проверь что есть OPENAI_API_KEY = sk-or-v1-...")
+        return
     if not photos:
         await m.answer("Кинь фото сначала!")
         return
@@ -52,13 +55,13 @@ async def report(m: types.Message):
 
     try:
         imgs = []
-        for fid in photos[-6:]: # берем последние 6 фото
+        for fid in photos[-5:]:
             file = await bot.get_file(fid)
             fb = await bot.download_file(file.file_path)
             b64 = base64.b64encode(fb.read()).decode()
             imgs.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
-        prompt = f"Ты автоэксперт-перекуп. Клиент прислал авто: {desc}. Проанализируй фото. Дай: 1) Что за авто/состояние кузова 2) Что под капотом/салон 3) Косяки и на что торговаться 4) Рыночная цена и вердикт БРАТЬ/НЕ БРАТЬ. Пиши коротко, по-пацански, на русском, как для своих."
+        prompt = f"Ты автоэксперт-перекуп. Авто: {desc}. Проанализируй фото, дай: кузов, салон, косяки, что спросить, рыночная цена, вердикт БРАТЬ/НЕ БРАТЬ. Пиши коротко по-пацански на русском."
 
         resp = await client.chat.completions.create(
             model="google/gemini-2.0-flash-exp:free",
@@ -68,7 +71,7 @@ async def report(m: types.Message):
         await m.answer(f"📋 ОТЧЕТ ГОТОВ:\n\n{answer}")
         user_data[uid] = {"photos": [], "desc": ""}
     except Exception as e:
-        await m.answer(f"Ошибка AI: {e}\nПопробуй еще раз /start")
+        await m.answer(f"Ошибка AI: {e}")
 
 async def main():
     await dp.start_polling(bot)
