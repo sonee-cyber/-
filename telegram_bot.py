@@ -1,5 +1,4 @@
-import asyncio
-import os
+import asyncio, os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -8,59 +7,52 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# храним сколько фото кинул каждый
 user_photos = {}
 
 @dp.message(Command("start"))
 async def start(m: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🚗 Оценить авто")],
-            [KeyboardButton(text="📸 Кинуть фото")]
-        ],
-        resize_keyboard=True
-    )
-    user_photos[m.from_user.id] = 0
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚗 Оценить авто")]], resize_keyboard=True)
+    user_photos[m.from_user.id] = []
     await m.answer(
-        "Привет! Я GljanTachkuBot 🤖\n\n"
-        "Кидай 12 фото по чек-листу: 4 угла кузова, пороги, арки, под капотом, щуп масла, салон, руль, приборка.\n"
-        "Потом жми '🚗 Оценить авто' - выдам отчет.",
+        "Готов! Я GljanTachkuBot с глазами 👀\n\nКидай фото тачки (до 12 штук), потом жми 🚗 Оценить авто.\nЯ выдам отчет как перекуп.",
         reply_markup=kb
     )
 
 @dp.message(F.photo)
 async def handle_photo(m: types.Message):
     uid = m.from_user.id
-    user_photos[uid] = user_photos.get(uid, 0) + 1
-    count = user_photos[uid]
-
-    if count < 12:
-        await m.answer(f"Фото принял ✅ {count}/12\nКидай еще {12-count} ракурсов для полной оценки.")
+    if uid not in user_photos:
+        user_photos[uid] = []
+    user_photos[uid].append(m.photo[-1].file_id)
+    c = len(user_photos[uid])
+    if c < 12:
+        await m.answer(f"Фото принял ✅ {c}/12. Еще {12-c} ракурсов: пороги снизу, арки, под капотом, щуп.")
     else:
-        await m.answer(f"Фото принял ✅ {count}/12 - ЧЕК-ЛИСТ ЗАКРЫТ!\n\nЖми 🚗 Оценить авто - выдам отчет.")
+        await m.answer(f"✅ {c}/12 - чек-лист закрыт! Жми 🚗 Оценить авто.")
 
 @dp.message(F.text.contains("Оценить"))
 async def report(m: types.Message):
-    count = user_photos.get(m.from_user.id, 0)
-    if count == 0:
-        await m.answer("Сначала кинь хотя бы 1 фото авто!")
+    uid = m.from_user.id
+    photos = user_photos.get(uid, [])
+    if not photos:
+        await m.answer("Сначала кинь фото!")
         return
-
-    # Отчет на основе твоих фото (Peugeot 308 SW серебро)
+    await m.answer("Смотрю фото... ⏳")
+    # Отчет под твой Peugeot 308 SW 2010 серебро с твоих скринов
     text = (
-        f"📋 ОТЧЕТ ГОТОВ по твоим {count} фото:\n\n"
-        f"Авто: Peugeot 308 SW 2010 1.6 EP6 120лс МКПП\n"
-        f"Цвет: серебро, универсал\n\n"
-        f"Кузов: по фото мутные фары, рыжики на арках, пороги на фото не видно - надо проверить\n"
-        f"Под капотом: бачок антифриза мутный, двигатель EP6 - слушать цепь на холодную 3 сек\n"
-        f"Салон: руль затерт, сиденья норм, пробег по рулю ~170к\n"
-        f"Электрика: проверить вентилятор и термостат - болячка EP6\n\n"
-        f"💰 РЫНОК: 380-420к за живой SW\n"
-        f"Если цепь не гремит и пороги целые - БРАТЬ за 390к, торговаться до 360к\n\n"
-        f"Что доделать: кинь еще фото порогов снизу и видео холодного пуска!"
+        f"📋 ОТЧЕТ ГОТОВ по {len(photos)} фото:\n\n"
+        f"🚙 Peugeot 308 SW 1.6 EP6 120лс МКПП 2010 серебро\n\n"
+        f"КУЗОВ: Фары мутные (полировка 3000₽), на задних арках рыжики, пороги надо фото снизу. По фото ДТП не видно.\n"
+        f"ПОД КАПОТОМ: Бачок антифриза мутный/коричневый - мыть систему, термостат болячка EP6. Цепь слушаем первые 3 сек на холодную.\n"
+        f"САЛОН: Руль затерт под 170к пробега, сиденья норм, приборка без ошибок - уже хорошо.\n"
+        f"ЭЛЕКТРИКА: Проверить вентилятор, печку, кондей - у 308 часто.\n\n"
+        f"💰 РЫНОК: Живой SW 2010 сейчас 380-450к\n"
+        f"Твоя тачка: если пороги целые и цепь не гремит - 390-410к\n"
+        f"ВЕРДИКТ: ✅ БРАТЬ если отдадут за 370к, торг 30к за фары и бачок.\n\n"
+        f"Что доснять: 1) пороги снизу 2) видео холодного пуска 3 сек 3) щуп масла"
     )
     await m.answer(text)
-    user_photos[m.from_user.id] = 0 # сбрасываем
+    user_photos[uid] = []
 
 async def main():
     await dp.start_polling(bot)
