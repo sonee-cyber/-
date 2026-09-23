@@ -26,7 +26,12 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1") if OR_KEY else None
+try:
+    client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1") if OR_KEY else None
+    print(f"OpenAI client OK: {bool(client)}")
+except Exception as e:
+    print(f"OpenAI init failed: {e} - running without AI, will show RAW")
+    client = None
 
 user_data = {}
 
