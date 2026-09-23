@@ -17,7 +17,7 @@ OR_KEY = os.getenv("OPENAI_API_KEY")
 APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN")
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v6.2 | BOT_TOKEN={bool(BOT_TOKEN)} APIPOINT_KEY={bool(APIPOINT_KEY)} OPENAI={bool(OR_KEY)}")
+print(f"BOOT v6.3 | BOT_TOKEN={bool(BOT_TOKEN)} APIPOINT_KEY={bool(APIPOINT_KEY)} OPENAI={bool(OR_KEY)}")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN env is empty! Set it in Railway Variables")
@@ -44,23 +44,43 @@ def cancel_kb():
 
 HOOD_STEPS = ["1/8 — Спереди","2/8 — Сзади","3/8 — Левый бок","4/8 — Правый бок","5/8 — VIN","6/8 — Приборка","7/8 — Под капотом","8/8 — Видео"]
 
-def is_vin(s): return bool(re.match(r'^[A-HJ-NPR-Z0-9]{17}$', s.upper().strip()))
-def is_gosnum(s):
-    s=s.upper().replace(" ","")
-    return bool(re.match(r'^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$', s))
+def normalize_plate(s: str) -> str:
+    """Латиницу -> кириллицу для API"""
+    s = s.upper().replace(" ", "").replace("-", "")
+    mapping = {'A':'А','B':'В','E':'Е','K':'К','M':'М','H':'Н','O':'О','P':'Р','C':'С','T':'Т','Y':'У','X':'Х'}
+    out = ""
+    for ch in s:
+        out += mapping.get(ch, ch)
+    return out
+
+def is_vin(s: str):
+    return bool(re.match(r'^[A-HJ-NPR-Z0-9]{17}$', s.upper().strip()))
+
+def is_gosnum(s: str):
+    s_clean = s.upper().replace(" ", "").replace("-", "")
+    allowed = "АВЕКМНОРСТУХABEKMHOPCTYX"
+    pattern = rf'^[{allowed}]\d{{3}}[{allowed}]{{2}}\d{{2,3}}$'
+    return bool(re.match(pattern, s_clean))
+
+def extract_gos(t: str):
+    allowed = "АВЕКМНОРСТУХABEKMHOPCTYX"
+    m = re.search(rf'[{allowed}]\d{{3}}[{allowed}]{{2}}\s*\d{{2,3}}', t.upper())
+    if m:
+        return normalize_plate(m.group(0))
+    return None
+
 def extract_urls(t): return re.findall(r'https?://[^\s]+', t)
-def extract_gos(t):
-    m=re.search(r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\s*\d{2,3}', t.upper())
-    return m.group(0).replace(" ","") if m else None
 
 async def apipoint_full_report(gos_or_vin: str):
     if not APIPOINT_KEY:
         return {"error": "no APIPOINT_KEY"}
-    clean = gos_or_vin.upper().replace(" ","")
+    orig = gos_or_vin.upper().replace(" ", "")
+    clean = normalize_plate(gos_or_vin)
+    is_v = is_vin(orig)
     sources = "gibdd,dtp,zalog,probeg,fsspdata,nomerogram,offerbygosnum,carprices,regperiods,gibddhistory,autophoto,gai,fines,osago"
     payload = {"sources": sources}
-    if is_vin(clean):
-        payload["vin"] = clean
+    if is_v:
+        payload["vin"] = orig
     else:
         payload["gosnum"] = clean
         payload["vin"] = ""
@@ -73,7 +93,7 @@ async def apipoint_full_report(gos_or_vin: str):
         try:
             async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 txt = await resp.text()
-                print(f"[APIPOINT] status={resp.status} resp[:2000]={txt[:2000]}")
+                print(f"[APIPOINT] status={resp.status} payload={payload} resp[:2000]={txt[:2000]}")
                 try:
                     data = json.loads(txt)
                 except:
@@ -108,7 +128,6 @@ async def fetch_ad_data(url: str):
         return {"url": url, "error": str(e), "images": []}
 
 def b64_from_bytes(b: bytes): return base64.b64encode(b).decode()
-
 def get_vin_template(ad=None):
     t = ad.get("title")[:60] if ad and ad.get("title") else "ваше авто"
     return f"Привет! Интересует {t}.\n\nМожете скинуть, пожалуйста:\n1. Госномер и VIN для проверки по базам ГИБДД/залоги\n2. Фото ПТС\n3. Фото порогов изнутри, стаканов\n4. Видео холодного запуска 15 сек\n\nСразу подъеду если все ок."
@@ -117,7 +136,7 @@ def get_vin_template(ad=None):
 async def start(m: types.Message):
     print(f"/start from {m.from_user.id}")
     user_data[m.from_user.id] = {"stage":"idle","photos_hood":[],"hood_step":0,"last_gos":"","last_ad":None}
-    await m.answer("Бот v6.2 — работает ✅\nКидай госномер Х423КО550 для теста апиПоинт", reply_markup=main_kb())
+    await m.answer("Бот v6.3 — принимает и латиницу и кириллицу ✅\nКидай Х423КО550 или X423KO550", reply_markup=main_kb())
 
 @dp.message(F.text=="🔄 Сбросить")
 async def reset(m: types.Message):
@@ -146,7 +165,7 @@ async def handle_text(m: types.Message):
     print(f"text from {uid}: {txt[:100]} stage={user_data.get(uid,{}).get('stage')}")
     if any(x in txt for x in ["Дистанционка","у капота","Запросить VIN","Сбросить"]): return
     urls=extract_urls(txt)
-    gos=extract_gos(txt) or (txt.upper().replace(" ","") if is_gosnum(txt) or is_vin(txt) else None)
+    gos=extract_gos(txt) or (normalize_plate(txt) if is_gosnum(txt) or is_vin(txt) else None)
 
     if urls:
         ad_url=urls[0]
@@ -178,15 +197,16 @@ async def handle_text(m: types.Message):
         await do_full(m, user_data[uid].get("last_ad"), user_data[uid].get("ad_images_b64",[]), gos)
         return
 
-    if (user_data.get(uid,{}).get("stage")=="await_gos" or not user_data.get(uid,{}).get("stage")) and gos:
-        user_data[uid]["last_gos"]=gos
+    if gos:
+        user_data.setdefault(uid, {})["last_gos"]=gos
         await m.answer(f"Бью по апиПоинт {gos} одним запросом по всем базам... ⏳")
         raw=await apipoint_full_report(gos)
         await ai_remote(m, gos, raw)
         return
     else:
-        if txt and len(txt) < 20 and not urls:
-            await m.answer(f"Не понял номер: {txt}\nПришли госномер типа Х423КО550 или VIN, или ссылку на Авито", reply_markup=main_kb())
+        if txt and len(txt) < 20 and not urls and txt not in ["🔍 Дистанционка по номеру/VIN/ссылке", "🚗 Я у капота (фото+видео)"]:
+            if not is_gosnum(txt) and not is_vin(txt):
+                await m.answer(f"Не понял номер: {txt}\nПришли госномер типа Х423КО550 / X423KO550 или VIN, или ссылку на Авито", reply_markup=main_kb())
 
 async def do_full(m, ad_data, ad_images_b64, gos):
     uid=m.from_user.id
