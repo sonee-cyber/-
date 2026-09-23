@@ -17,10 +17,10 @@ OR_KEY = os.getenv("OPENAI_API_KEY")
 APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN")
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v6.3 | BOT_TOKEN={bool(BOT_TOKEN)} APIPOINT_KEY={bool(APIPOINT_KEY)} OPENAI={bool(OR_KEY)}")
+print(f"BOOT v7 FINAL | BOT={bool(BOT_TOKEN)} APIPOINT={bool(APIPOINT_KEY)}")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN env is empty! Set it in Railway Variables")
+    raise ValueError("BOT_TOKEN empty")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -68,79 +68,39 @@ def extract_gos(t: str):
         return normalize_plate(m.group(0))
     return None
 
+def extract_vin(t: str):
+    m = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', t.upper())
+    return m.group(0) if m else None
+
 def extract_urls(t): return re.findall(r'https?://[^\s]+', t)
 
-async def apipoint_full_report(gos_or_vin: str, single_source: str = None):
-    if not APIPOINT_KEY:
-        return {"error": "no APIPOINT_KEY"}
-    orig = gos_or_vin.upper().replace(" ", "")
-    clean = normalize_plate(gos_or_vin)
-    is_v = is_vin(orig)
-    if single_source:
-        sources = single_source
-    else:
-        sources = "zalog"
-    payload = {"sources": sources}
-    if is_v:
-        payload["vin"] = orig
-    else:
-        payload["gosnum"] = clean
-        payload["query"] = clean
-        payload["number"] = clean
-        payload["vin"] = ""
-    headers = {
-        "Authorization": f"Bearer {APIPOINT_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+VALID_SOURCES_VIN = ["zalog","fsspdata","gibddhistory","dtp","probeg","nomerogram","carprices","gai","regperiods","autophoto","offerbygosnum"]
+VALID_SOURCES_GOS = ["zalog"]
+
+async def apipoint_call(payload):
+    headers = {"Authorization": f"Bearer {APIPOINT_KEY}", "Content-Type": "application/json", "Accept": "application/json"}
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 txt = await resp.text()
-                print(f"[APIPOINT] status={resp.status} payload={payload} resp[:3000]={txt[:3000]}")
+                print(f"[APIPOINT] {payload} -> {resp.status} {txt[:2000]}")
                 try:
                     data = json.loads(txt)
                 except:
                     data = {"raw": txt}
-                data["_debug_status"] = resp.status
-                data["_debug_payload"] = payload
-                return data
+                return resp.status, data
         except Exception as e:
-            return {"error": f"exception {e}", "payload": payload}
+            return 0, {"error": str(e)}
 
-async def apipoint_multi(gos_or_vin: str):
-    orig = gos_or_vin.upper().replace(" ", "")
-    clean = normalize_plate(gos_or_vin)
-    is_v = is_vin(orig)
-    candidates = ["zalog", "fssp", "fsspdata", "gibdd", "gibdd_history", "gibddhistory", "dtp", "probeg", "nomerogram", "carprices", "osago", "fines", "gai", "history", "regperiods", "autophoto", "offerbygosnum"]
-    results = {}
-    headers = {
-        "Authorization": f"Bearer {APIPOINT_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    async with aiohttp.ClientSession() as session:
-        for src in candidates:
-            payload = {"sources": src}
-            if is_v:
-                payload["vin"] = orig
-            else:
-                payload["gosnum"] = clean
-                payload["query"] = clean
-                payload["number"] = clean
-                payload["vin"] = ""
-            try:
-                async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    txt = await resp.text()
-                    try:
-                        data = json.loads(txt)
-                    except:
-                        data = {"raw": txt[:2000]}
-                    results[src] = {"status": resp.status, "data": data}
-                    print(f"[MULTI] src={src} status={resp.status} txt[:500]={txt[:500]}")
-            except Exception as e:
-                results[src] = {"error": str(e)}
-    return results
+async def check_by_gos(gos):
+    payload = {"sources": "zalog", "gosnum": gos}
+    status, data = await apipoint_call(payload)
+    return data
+
+async def check_by_vin(vin):
+    payload = {"sources": ",".join(VALID_SOURCES_VIN), "vin": vin}
+    status, data = await apipoint_call(payload)
+    return data
 
 async def fetch_ad_data(url: str):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -168,13 +128,12 @@ async def fetch_ad_data(url: str):
 def b64_from_bytes(b: bytes): return base64.b64encode(b).decode()
 def get_vin_template(ad=None):
     t = ad.get("title")[:60] if ad and ad.get("title") else "ваше авто"
-    return f"Привет! Интересует {t}.\n\nМожете скинуть, пожалуйста:\n1. Госномер и VIN для проверки по базам ГИБДД/залоги\n2. Фото ПТС\n3. Фото порогов изнутри, стаканов\n4. Видео холодного запуска 15 сек\n\nСразу подъеду если все ок."
+    return f"Привет! Интересует {t}.\n\nСкиньте, пожалуйста, VIN и госномер — пробью по ГИБДД/залоги/ДТП.\nА также: фото ПТС, порогов изнутри, стаканов и видео холодного запуска 15 сек.\n\nСразу подъеду если все ок."
 
 @dp.message(Command("start"))
 async def start(m: types.Message):
-    print(f"/start from {m.from_user.id}")
     user_data[m.from_user.id] = {"stage":"idle","photos_hood":[],"hood_step":0,"last_gos":"","last_ad":None}
-    await m.answer("Бот v6.3 — принимает и латиницу и кириллицу ✅\nКидай Х423КО550 или X423KO550", reply_markup=main_kb())
+    await m.answer("Бот v7 — готов ✅\nКидай госномер (Х423КО550 / X423KO550) или VIN.\nПо госномеру покажу флаг залога, для полного отчета нужен VIN.", reply_markup=main_kb())
 
 @dp.message(F.text=="🔄 Сбросить")
 async def reset(m: types.Message):
@@ -189,7 +148,7 @@ async def vin_req(m: types.Message):
 @dp.message(F.text.contains("Дистанционка"))
 async def mode_remote(m: types.Message):
     user_data[m.from_user.id]={"stage":"await_gos","last_ad":None}
-    await m.answer("🔍 Кидай ссылку + госномер. Если номера нет — жми 📩 Запросить VIN", reply_markup=cancel_kb())
+    await m.answer("🔍 Кидай ссылку + госномер или VIN. Если номера нет — жми 📩 Запросить VIN", reply_markup=cancel_kb())
 
 @dp.message(F.text.contains("у капота"))
 async def mode_hood(m: types.Message):
@@ -200,14 +159,16 @@ async def mode_hood(m: types.Message):
 async def handle_text(m: types.Message):
     uid=m.from_user.id
     txt=m.text.strip()
-    print(f"text from {uid}: {txt[:100]} stage={user_data.get(uid,{}).get('stage')}")
     if any(x in txt for x in ["Дистанционка","у капота","Запросить VIN","Сбросить"]): return
     urls=extract_urls(txt)
-    gos=extract_gos(txt) or (normalize_plate(txt) if is_gosnum(txt) or is_vin(txt) else None)
+    vin=extract_vin(txt)
+    gos=extract_gos(txt) or (normalize_plate(txt) if is_gosnum(txt) else None)
+    if vin: gos = None
 
     if urls:
         ad_url=urls[0]
         if gos: user_data.setdefault(uid,{})["last_gos"]=gos
+        if vin: user_data.setdefault(uid,{})["last_vin"]=vin
         await m.answer(f"Вижу ссылку ✅ {ad_url}\nТяну объявление... ⏳")
         ad_data=await fetch_ad_data(ad_url)
         user_data.setdefault(uid,{})["last_ad"]=ad_data
@@ -221,85 +182,86 @@ async def handle_text(m: types.Message):
                                 b=await r.read()
                                 ad_images.append(b64_from_bytes(b))
                     except: pass
-        if not user_data.get(uid,{}).get("last_gos"):
+        if not gos and not vin:
             user_data[uid]["stage"]="await_gos_for_ad"
             user_data[uid]["ad_images_b64"]=ad_images
-            await m.answer(f"📄 {ad_data.get('title','')[:100]}\nЦена: {ad_data.get('price','?')} ₽\n\nГосномер скрыт — нажми 📩 Запросить VIN", reply_markup=cancel_kb())
+            await m.answer(f"📄 {ad_data.get('title','')[:100]}\nЦена: {ad_data.get('price','?')} ₽\n\nГосномер скрыт — нажми 📩 Запросить VIN и кинь номер/VIN", reply_markup=cancel_kb())
             return
         else:
-            await do_full(m, ad_data, ad_images, user_data[uid]["last_gos"])
+            target = vin or gos
+            await do_full(m, ad_data, ad_images, target)
             return
 
-    if user_data.get(uid,{}).get("stage")=="await_gos_for_ad" and gos:
+    if user_data.get(uid,{}).get("stage")=="await_gos_for_ad" and (gos or vin):
+        target = vin or gos
         user_data[uid]["last_gos"]=gos
-        await do_full(m, user_data[uid].get("last_ad"), user_data[uid].get("ad_images_b64",[]), gos)
+        await do_full(m, user_data[uid].get("last_ad"), user_data[uid].get("ad_images_b64",[]), target)
         return
 
+    if vin:
+        await m.answer(f"Бью по VIN {vin} по всем базам... ⏳")
+        data = await check_by_vin(vin)
+        await ai_report(m, vin, data, is_vin=True)
+        return
     if gos:
-        user_data.setdefault(uid, {})["last_gos"]=gos
-        await m.answer(f"Бью по апиПоинт {gos} — тестирую источники... ⏳")
-        raw_multi=await apipoint_multi(gos)
-        await ai_remote(m, gos, raw_multi)
+        await m.answer(f"Бью по госномеру {gos} (флаг залога)... ⏳")
+        data = await check_by_gos(gos)
+        await ai_report(m, gos, data, is_vin=False)
         return
-    else:
-        if txt and len(txt) < 20 and not urls and txt not in ["🔍 Дистанционка по номеру/VIN/ссылке", "🚗 Я у капота (фото+видео)"]:
-            if not is_gosnum(txt) and not is_vin(txt):
-                await m.answer(f"Не понял номер: {txt}\nПришли госномер типа Х423КО550 / X423KO550 или VIN, или ссылку на Авито", reply_markup=main_kb())
 
-async def do_full(m, ad_data, ad_images_b64, gos):
+async def do_full(m, ad_data, ad_images_b64, target):
     uid=m.from_user.id
-    await m.answer(f"Делаю комбо-отчет по {gos}... ⏳")
-    raw=await apipoint_full_report(gos)
+    await m.answer(f"Делаю комбо-отчет по {target}... ⏳")
+    if is_vin(target):
+        data = await check_by_vin(target)
+    else:
+        data = await check_by_gos(target)
     if not client:
-        await m.answer(f"RAW:\n{json.dumps(raw, ensure_ascii=False)[:4000]}")
+        await m.answer(f"RAW:\n{json.dumps(data, ensure_ascii=False)[:5000]}")
         return
     vision=[]
     for b64 in ad_images_b64[:5]:
         vision.append({"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{b64}"}})
-    prompt = f"Ты перекуп. Ссылка {ad_data.get('url')} Гос {gos} Объява {ad_data.get('title')} Цена {ad_data.get('price')} Базы {json.dumps(raw, ensure_ascii=False)[:12000]} Сделай: ТАЧКА, ФОТО, СВЕРКА С БАЗАМИ, ЦЕНА, ВЕРДИКТ."
+    prompt = f"Ты перекуп. Ссылка {ad_data.get('url')} Цель {target} Объява {ad_data.get('title')} Цена {ad_data.get('price')} Базы {json.dumps(data, ensure_ascii=False)[:15000]} Сделай отчет: ТАЧКА, ФОТО, СВЕРКА С БАЗАМИ, ЦЕНА, ВЕРДИКТ. Если только госномер и ошибка 112 про VIN — скажи что нужен VIN."
     try:
         resp=await client.chat.completions.create(model="openai/gpt-4o-mini", messages=[{"role":"user","content":[{"type":"text","text":prompt}]+vision}], max_tokens=1500)
         await m.answer(resp.choices[0].message.content, reply_markup=main_kb())
-        user_data[uid]["stage"]="idle"
     except Exception as e:
-        await m.answer(f"Ошибка ИИ: {e} RAW: {json.dumps(raw, ensure_ascii=False)[:2000]}")
+        await m.answer(f"Ошибка ИИ: {e} RAW: {json.dumps(data, ensure_ascii=False)[:2000]}")
 
-async def ai_remote(m, gos, raw):
-    if isinstance(raw, dict) and any(k in raw for k in ["zalog", "gibdd", "fssp"]):
-        alive = []
-        dead = []
-        for src, info in raw.items():
-            st = info.get("status", 0)
-            data = info.get("data", {})
-            if st == 200 and isinstance(data, dict) and data.get("status", 200) == 200:
-                alive.append(src)
-            else:
-                dead.append(f"{src}:{st}")
-        txt = f"🔎 Тест источников по {gos}:\nЖивые: {', '.join(alive) or 'нет'}\nМертвые: {', '.join(dead)[:1000]}\n\nRAW пример zalog: {json.dumps(raw.get('zalog',{}), ensure_ascii=False)[:2000]}"
-        await m.answer(txt, reply_markup=main_kb())
-        if alive:
-            raw_single = await apipoint_full_report(gos, single_source=",".join(alive[:5]))
-            raw = raw_single
-        else:
-            await m.answer(f"Все источники вернули 404. Возможно у тебя подключен только zalog по VIN. Попробуй VIN вместо госномера.\n\nПолный RAW: {json.dumps(raw, ensure_ascii=False)[:4000]}", reply_markup=main_kb())
-            return
-
-    if "error" in raw and "data" not in raw and "result" not in raw and "_debug_status" not in raw:
-        await m.answer(f"❌ АпиПоинт ошибка: {json.dumps(raw, ensure_ascii=False)[:2000]}", reply_markup=main_kb())
-        return
+async def ai_report(m, target, data, is_vin=False):
+    balance = data.get("balance") or data.get("data",{}).get("balance")
+    price = data.get("price") or data.get("data",{}).get("price")
+    result = data.get("result") or data.get("data",{}).get("result") or data
+    zalog = result.get("zalog") if isinstance(result, dict) else None
+    zalog_flag = False
+    need_vin_msg = ""
+    if isinstance(zalog, dict):
+        zalog_flag = zalog.get("f") == True
+        if zalog.get("error_code") == 112:
+            need_vin_msg = zalog.get("error_msg") or "Должен быть указан VIN"
     if not client:
-        await m.answer(f"RAW апиПоинт:\n{json.dumps(raw, ensure_ascii=False)[:5000]}", reply_markup=main_kb())
+        await m.answer(f"RAW:\n{json.dumps(data, ensure_ascii=False)[:5000]}", reply_markup=main_kb())
         return
-    balance = raw.get("balance")
-    price = raw.get("price")
-    result = raw.get("result", raw)
-    await m.answer(f"📦 Сырой ответ апиПоинт (баланс {balance} цена {price}):\n{json.dumps(result, ensure_ascii=False)[:4000]}", reply_markup=main_kb())
-    prompt = f"Авто {gos} Баланс {balance} Цена {price} Данные {json.dumps(result, ensure_ascii=False)[:15000]} Сделай отчет: ГИБДД, ДТП, залог, ФССП, пробег, Номерограм, цена, ВЕРДИКТ."
+    if not is_vin:
+        if zalog_flag:
+            txt = f"### Отчет по {target}\nБаланс: {balance} Цена: {price}\n\n**Залог:** Да, флаг f=true (авто возможно в залоге)\n**Но:** {need_vin_msg}\n\nДля полного отчета (ГИБДД, ДТП, ФССП, пробег, номерограмма) нужен VIN. Нажми 📩 Запросить VIN у продавца и скинь VIN."
+            await m.answer(txt, reply_markup=cancel_kb())
+        else:
+            await m.answer(f"По госномеру {target} залог не найден, но без VIN полный отчет невозможен. Баланс {balance}. Скинь VIN.", reply_markup=cancel_kb())
+        prompt = f"Авто госномер {target} Результат залога {json.dumps(zalog, ensure_ascii=False)} Баланс {balance} Сделай краткий вердикт: залог флаг, почему нужен VIN, что запросить у продавца."
+        try:
+            r=await client.chat.completions.create(model="openai/gpt-4o-mini", messages=[{"role":"user","content":prompt}], max_tokens=1000)
+            await m.answer(r.choices[0].message.content, reply_markup=main_kb())
+        except Exception as e:
+            await m.answer(f"Ошибка ИИ: {e}")
+        return
+    prompt = f"Авто VIN {target} Баланс {balance} Цена {price} Данные {json.dumps(result, ensure_ascii=False)[:15000]} Сделай полный отчет: 1.ГИБДД 2.ДТП 3.Залог 4.ФССП 5.Пробег 6.Номерограмма 7.Цена 8.ВЕРДИКТ — брать или нет и почему."
     try:
         r=await client.chat.completions.create(model="openai/gpt-4o-mini", messages=[{"role":"user","content":prompt}], max_tokens=1500)
         await m.answer(r.choices[0].message.content, reply_markup=main_kb())
     except Exception as e:
-        await m.answer(f"Ошибка ИИ: {e} RAW: {json.dumps(raw, ensure_ascii=False)[:3000]}")
+        await m.answer(f"Ошибка ИИ: {e} RAW: {json.dumps(data, ensure_ascii=False)[:3000]}")
 
 @dp.message(F.photo)
 async def handle_photo(m: types.Message):
@@ -326,9 +288,7 @@ async def handle_photo(m: types.Message):
 async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook deleted")
-    except Exception as e:
-        print(f"delete_webhook error: {e}")
+    except: pass
     print("Start polling...")
     await dp.start_polling(bot)
 
