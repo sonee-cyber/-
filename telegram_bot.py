@@ -19,7 +19,7 @@ OR_KEY = os.getenv("OPENAI_API_KEY")
 APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN")
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v12 FIX ENCODING | BOT={bool(BOT_TOKEN)} APIPOINT={bool(APIPOINT_KEY)}")
+print(f"BOOT v15 RUSSIAN DROM | BOT={bool(BOT_TOKEN)} APIPOINT={bool(APIPOINT_KEY)}")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN empty")
@@ -246,7 +246,7 @@ async def do_full(m, ad_data, ad_images_b64, target):
     vision=[]
     for b64 in ad_images_b64[:5]:
         vision.append({"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{b64}"}})
-    prompt = f"You are car dealer. Link {ad_data.get('url')} Target {target} Ad {ad_data.get('title')} Price {ad_data.get('price')} Bases {json.dumps(data, ensure_ascii=False)[:12000]} Make report: CAR, PHOTO, BASES CHECK, PRICE, VERDICT."
+    prompt = f"Ты — автоподборщик. Ссылка {ad_data.get('url')} Цель {target} Объявление {ad_data.get('title')} Цена {ad_data.get('price')} Базы {json.dumps(data, ensure_ascii=False)[:12000]} Сделай отчет на РУССКОМ: АВТО, ФОТО, ПРОВЕРКА БАЗ, ЦЕНА, ВЕРДИКТ. Пиши как на Дроме, без воды."
     try:
         resp=await client.chat.completions.create(model="openai/gpt-4o-mini", messages=[{"role":"user","content":[{"type":"text","text":prompt}]+vision}], max_tokens=1500)
         await m.answer(resp.choices[0].message.content, reply_markup=main_kb())
@@ -305,7 +305,7 @@ async def ai_report(m, target, data, is_vin=False):
 
     if not is_vin:
         zalog_f = zalog.get("f") if isinstance(zalog, dict) else None
-        prompt = f"Plate {target} pledge f={zalog_f} balance {balance} result {json.dumps(zalog, ensure_ascii=False)}. Make short verdict: if f=true — in pledge, need VIN."
+        prompt = f"Госномер {target} залог f={zalog_f} баланс {balance}. Сделай короткий вердикт на РУССКОМ: если f=true — в залоге, нужен VIN для полной проверки. Если f=false — не в залоге. Пиши только по-русски."
     else:
         brand = (gibdd_parsed or {}).get("vehicle_brandmodel") or reg.get("markaModel") or "OPEL ASTRA"
         year = (gibdd_parsed or {}).get("vehicle_releaseyear") or reg.get("year") or "2007-2008"
@@ -322,23 +322,49 @@ async def ai_report(m, target, data, is_vin=False):
             zalog_error = False
 
         prompt = f"""
-You are car expert. VIN {target}:
-- Brand: {brand}, year {year}
-- Owners: {json.dumps(periods, ensure_ascii=False)}
-- Mileage history: {json.dumps(history, ensure_ascii=False)}
-- Rollbacks: {rollback_text or "none"}
-- ДТП: hasDtp={has_dtp}
-- Pledge: f={zalog.get('f')} Error={zalog_error}
-Make DROM-style report:
-1. GIBDD — periods, change 27.06.2026 is 3 months ago, maybe dealer
-2. ДТП — none
-3. Pledge — service unavailable, check manually
-4. Mileage — 141048 in 2021, old, ask service book, check rollback
-5. Repairs: from screenshots — rear right door replacement 13168046, side 5183230, cost 150-200k, front right door painting <50% etc.
-6. Price: listed 270k 20.06.2026, dropped to 250k 09.07.2026
-7. VERDICT: cautious, 2 owners for 16 years ok, but sale after 3 months suspicious. Plus no ДТП. Minus pledge not checked, old mileage, recent resale. Give 3 questions to seller.
+Ты — эксперт по проверке авто как на Дроме. Пиши ТОЛЬКО на русском, конкретно, без воды, как в отчете Дрома.
 
-No generic phrases.
+VIN {target}:
+- Авто: {brand}, год {year}
+- Владельцы: {json.dumps(periods, ensure_ascii=False)}
+- Пробег: {json.dumps(history, ensure_ascii=False)} + последний из ТО 141048 км 20.08.2021
+- Скрутки: {rollback_text or "нет явных, но пробег старый"}
+- ДТП: hasDtp={has_dtp}
+- Залог: f={zalog.get('f')} Error={zalog_error} ErrorMessage сервис временно не доступен
+- Баланс apipoint {balance}
+
+Сделай отчет в стиле ДРОМ:
+
+## ГИБДД:
+- 1 владелец с 03.04.2010 по 27.06.2026 — 16 лет у одного человека, это плюс
+- 27.06.2026 смена собственника — 3 месяца назад, подозрительно, возможно перекуп/площадка
+- Последнее действие: В связи с изменением собственника
+
+## ДТП:
+- hasDtp={has_dtp} — ДТП не найдено, по базам чисто
+
+## Залог:
+- f={zalog.get('f')} но сервис выдал Error true / Сервис временно не доступен — нужно проверить вручную на reestr-zalogov.ru по VIN
+
+## Пробег:
+- Последний зафиксированный 141048 км 20.08.2021 из техосмотра — уже 5 лет назад! Свежего пробега нет.
+- Если на одометре сейчас сильно больше/меньше — уточняй сервисную книжку
+
+## Ремонты (если есть из скринов):
+- Для этой машины из твоих скринов: замена задней правой двери (деталь 13168046), боковина 5183230, окрас передней правой двери <50% — бюджет 150-200 тыс.
+
+## Вердикт:
+- Плюсы: 1 владелец 16 лет, нет ДТП, серебристый 308 1.6 120 л.с. — надежный
+- Минусы: перепродажа через 3 месяца, залог не проверился, пробег старый 2021 года, цена?
+
+Рекомендуется брать только если кузов живой и есть доки. Цена не должна превышать 350-400 тыс. из-за возраста и рисков, а не 500+.
+
+Задай 3 вопроса продавцу:
+1. Почему продаете через 3 месяца после покупки 27.06.2026?
+2. Есть ли сервисная книжка с пробегом после 20.08.2021?
+3. Проверяли ли залог вручную в реестре, есть документы?
+
+Без воды, конкретно как на Дроме.
 """
 
     try:
