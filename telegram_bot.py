@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 import asyncio, os, base64, re, json, logging, datetime
 import aiohttp
@@ -149,9 +150,9 @@ def get_vin_template(ad=None):
 @dp.message(Command("start"))
 async def start(m: types.Message):
     user_data[m.from_user.id] = {"stage":"idle","photos_hood":[],"hood_step":0,"last_gos":"","last_ad":None}
-    await m.answer("Bot v12 FIX - ready ✅\nSend plate X423KO550 or VIN.\nFor full report need VIN.", reply_markup=main_kb())
+    await m.answer("Bot v12 FIX - ready \u2705\nSend plate X423KO550 or VIN.\nFor full report need VIN.", reply_markup=main_kb())
 
-@dp.message(F.text=="🔄 Reset")
+@dp.message(F.text=="\U0001f504 Reset")
 async def reset(m: types.Message):
     user_data[m.from_user.id] = {"stage":"idle","photos_hood":[],"hood_step":0,"last_gos":"","last_ad":None}
     await m.answer("Reset done", reply_markup=main_kb())
@@ -226,7 +227,8 @@ async def handle_text(m: types.Message):
         data = await check_by_gos(gos)
         await ai_report(m, gos, data, is_vin=False)
         return
-        async def do_full(m, ad_data, ad_images_b64, target):
+
+async def do_full(m, ad_data, ad_images_b64, target):
     uid=m.from_user.id
     await m.answer(f"Making combo report for {target}... ")
     if is_vin(target):
@@ -320,16 +322,16 @@ You are car expert. VIN {target}:
 - Owners: {json.dumps(periods, ensure_ascii=False)}
 - Mileage history: {json.dumps(history, ensure_ascii=False)}
 - Rollbacks: {rollback_text or "none"}
-- Accidents: hasDtp={has_dtp}
+- ДТП: hasDtp={has_dtp}
 - Pledge: f={zalog.get('f')} Error={zalog_error}
 Make DROM-style report:
 1. GIBDD — periods, change 27.06.2026 is 3 months ago, maybe dealer
-2. Accidents — none
+2. ДТП — none
 3. Pledge — service unavailable, check manually
 4. Mileage — 141048 in 2021, old, ask service book, check rollback
 5. Repairs: from screenshots — rear right door replacement 13168046, side 5183230, cost 150-200k, front right door painting <50% etc.
 6. Price: listed 270k 20.06.2026, dropped to 250k 09.07.2026
-7. VERDICT: cautious, 2 owners for 16 years ok, but sale after 3 months suspicious. Plus no accidents. Minus pledge not checked, old mileage, recent resale. Give 3 questions to seller.
+7. VERDICT: cautious, 2 owners for 16 years ok, but sale after 3 months suspicious. Plus no ДТП. Minus pledge not checked, old mileage, recent resale. Give 3 questions to seller.
 
 No generic phrases.
 """
