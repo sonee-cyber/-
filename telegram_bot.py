@@ -45,7 +45,6 @@ def cancel_kb():
 HOOD_STEPS = ["1/8 — Спереди","2/8 — Сзади","3/8 — Левый бок","4/8 — Правый бок","5/8 — VIN","6/8 — Приборка","7/8 — Под капотом","8/8 — Видео"]
 
 def normalize_plate(s: str) -> str:
-    """Латиницу -> кириллицу для API"""
     s = s.upper().replace(" ", "").replace("-", "")
     mapping = {'A':'А','B':'В','E':'Е','K':'К','M':'М','H':'Н','O':'О','P':'Р','C':'С','T':'Т','Y':'У','X':'Х'}
     out = ""
@@ -71,18 +70,23 @@ def extract_gos(t: str):
 
 def extract_urls(t): return re.findall(r'https?://[^\s]+', t)
 
-async def apipoint_full_report(gos_or_vin: str):
+async def apipoint_full_report(gos_or_vin: str, single_source: str = None):
     if not APIPOINT_KEY:
         return {"error": "no APIPOINT_KEY"}
     orig = gos_or_vin.upper().replace(" ", "")
     clean = normalize_plate(gos_or_vin)
     is_v = is_vin(orig)
-    sources = "gibdd,dtp,zalog,probeg,fsspdata,nomerogram,offerbygosnum,carprices,regperiods,gibddhistory,autophoto,gai,fines,osago"
+    if single_source:
+        sources = single_source
+    else:
+        sources = "zalog"
     payload = {"sources": sources}
     if is_v:
         payload["vin"] = orig
     else:
         payload["gosnum"] = clean
+        payload["query"] = clean
+        payload["number"] = clean
         payload["vin"] = ""
     headers = {
         "Authorization": f"Bearer {APIPOINT_KEY}",
@@ -93,16 +97,50 @@ async def apipoint_full_report(gos_or_vin: str):
         try:
             async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 txt = await resp.text()
-                print(f"[APIPOINT] status={resp.status} payload={payload} resp[:2000]={txt[:2000]}")
+                print(f"[APIPOINT] status={resp.status} payload={payload} resp[:3000]={txt[:3000]}")
                 try:
                     data = json.loads(txt)
                 except:
                     data = {"raw": txt}
-                if resp.status!= 200:
-                    return {"status": resp.status, "error": txt[:2000], "payload": payload, "data": data}
+                data["_debug_status"] = resp.status
+                data["_debug_payload"] = payload
                 return data
         except Exception as e:
             return {"error": f"exception {e}", "payload": payload}
+
+async def apipoint_multi(gos_or_vin: str):
+    orig = gos_or_vin.upper().replace(" ", "")
+    clean = normalize_plate(gos_or_vin)
+    is_v = is_vin(orig)
+    candidates = ["zalog", "fssp", "fsspdata", "gibdd", "gibdd_history", "gibddhistory", "dtp", "probeg", "nomerogram", "carprices", "osago", "fines", "gai", "history", "regperiods", "autophoto", "offerbygosnum"]
+    results = {}
+    headers = {
+        "Authorization": f"Bearer {APIPOINT_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    async with aiohttp.ClientSession() as session:
+        for src in candidates:
+            payload = {"sources": src}
+            if is_v:
+                payload["vin"] = orig
+            else:
+                payload["gosnum"] = clean
+                payload["query"] = clean
+                payload["number"] = clean
+                payload["vin"] = ""
+            try:
+                async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    txt = await resp.text()
+                    try:
+                        data = json.loads(txt)
+                    except:
+                        data = {"raw": txt[:2000]}
+                    results[src] = {"status": resp.status, "data": data}
+                    print(f"[MULTI] src={src} status={resp.status} txt[:500]={txt[:500]}")
+            except Exception as e:
+                results[src] = {"error": str(e)}
+    return results
 
 async def fetch_ad_data(url: str):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -199,9 +237,9 @@ async def handle_text(m: types.Message):
 
     if gos:
         user_data.setdefault(uid, {})["last_gos"]=gos
-        await m.answer(f"Бью по апиПоинт {gos} одним запросом по всем базам... ⏳")
-        raw=await apipoint_full_report(gos)
-        await ai_remote(m, gos, raw)
+        await m.answer(f"Бью по апиПоинт {gos} — тестирую источники... ⏳")
+        raw_multi=await apipoint_multi(gos)
+        await ai_remote(m, gos, raw_multi)
         return
     else:
         if txt and len(txt) < 20 and not urls and txt not in ["🔍 Дистанционка по номеру/VIN/ссылке", "🚗 Я у капота (фото+видео)"]:
@@ -227,7 +265,26 @@ async def do_full(m, ad_data, ad_images_b64, gos):
         await m.answer(f"Ошибка ИИ: {e} RAW: {json.dumps(raw, ensure_ascii=False)[:2000]}")
 
 async def ai_remote(m, gos, raw):
-    if "error" in raw and "data" not in raw and "result" not in raw:
+    if isinstance(raw, dict) and any(k in raw for k in ["zalog", "gibdd", "fssp"]):
+        alive = []
+        dead = []
+        for src, info in raw.items():
+            st = info.get("status", 0)
+            data = info.get("data", {})
+            if st == 200 and isinstance(data, dict) and data.get("status", 200) == 200:
+                alive.append(src)
+            else:
+                dead.append(f"{src}:{st}")
+        txt = f"🔎 Тест источников по {gos}:\nЖивые: {', '.join(alive) or 'нет'}\nМертвые: {', '.join(dead)[:1000]}\n\nRAW пример zalog: {json.dumps(raw.get('zalog',{}), ensure_ascii=False)[:2000]}"
+        await m.answer(txt, reply_markup=main_kb())
+        if alive:
+            raw_single = await apipoint_full_report(gos, single_source=",".join(alive[:5]))
+            raw = raw_single
+        else:
+            await m.answer(f"Все источники вернули 404. Возможно у тебя подключен только zalog по VIN. Попробуй VIN вместо госномера.\n\nПолный RAW: {json.dumps(raw, ensure_ascii=False)[:4000]}", reply_markup=main_kb())
+            return
+
+    if "error" in raw and "data" not in raw and "result" not in raw and "_debug_status" not in raw:
         await m.answer(f"❌ АпиПоинт ошибка: {json.dumps(raw, ensure_ascii=False)[:2000]}", reply_markup=main_kb())
         return
     if not client:
@@ -236,6 +293,7 @@ async def ai_remote(m, gos, raw):
     balance = raw.get("balance")
     price = raw.get("price")
     result = raw.get("result", raw)
+    await m.answer(f"📦 Сырой ответ апиПоинт (баланс {balance} цена {price}):\n{json.dumps(result, ensure_ascii=False)[:4000]}", reply_markup=main_kb())
     prompt = f"Авто {gos} Баланс {balance} Цена {price} Данные {json.dumps(result, ensure_ascii=False)[:15000]} Сделай отчет: ГИБДД, ДТП, залог, ФССП, пробег, Номерограм, цена, ВЕРДИКТ."
     try:
         r=await client.chat.completions.create(model="openai/gpt-4o-mini", messages=[{"role":"user","content":prompt}], max_tokens=1500)
