@@ -19,7 +19,7 @@ OR_KEY = os.getenv("OPENAI_API_KEY")
 APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN")
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v15 RUSSIAN DROM | BOT={bool(BOT_TOKEN)} APIPOINT={bool(APIPOINT_KEY)}")
+print(f"BOOT v16 FINAL RUSSIAN | BOT={bool(BOT_TOKEN)} APIPOINT={bool(APIPOINT_KEY)}")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN empty")
@@ -155,7 +155,7 @@ def get_vin_template(ad=None):
 @dp.message(Command("start"))
 async def start(m: types.Message):
     user_data[m.from_user.id] = {"stage":"idle","photos_hood":[],"hood_step":0,"last_gos":"","last_ad":None}
-    await m.answer("Bot v12 FIX - ready \u2705\nSend plate X423KO550 or VIN.\nFor full report need VIN.", reply_markup=main_kb())
+    await m.answer("Bot v15 RUSSIAN DROM - ready 🇷🇺 \u2705\nSend plate X423KO550 or VIN.\nFor full report need VIN.", reply_markup=main_kb())
 
 @dp.message(F.text=="\U0001f504 Reset")
 async def reset(m: types.Message):
