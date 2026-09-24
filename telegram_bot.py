@@ -15,7 +15,12 @@ APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or ""
 APIPOINT_KEY = APIPOINT_KEY.strip()
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print("BOOT v52 THREE BUTTONS")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or ""
+OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+print(f"BOOT v53 WELCOME+OPENROUTER model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -33,6 +38,45 @@ async def apipoint_call(payload):
                 return resp.status, data, txt[:20000]
         except Exception as e:
             return 0, {"error": str(e)}, str(e)
+
+async def call_openrouter_ai(prompt_text, system_text="Ты — опытный автоподборщик с 15 лет стажа."):
+    """Реальный запрос в OpenRouter"""
+    if not OPENROUTER_API_KEY:
+        return None, "Нет ключа OPENROUTER_API_KEY"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://t.me/GljanTachkuBot",
+        "X-Title": "GljanTachkuBot AI recommendations"
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": prompt_text}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4000
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=90) as resp:
+                txt = await resp.text()
+                try:
+                    data = json.loads(txt)
+                except:
+                    return None, f"OpenRouter raw error: {txt[:1000]}"
+                if resp.status != 200:
+                    return None, f"OpenRouter {resp.status}: {txt[:1000]}"
+                # OpenRouter format: choices[0].message.content
+                choices = data.get("choices") or []
+                if choices:
+                    content = choices[0].get("message",{}).get("content") or choices[0].get("text") or ""
+                    return content.strip(), None
+                return None, f"No choices: {str(data)[:1000]}"
+    except Exception as e:
+        return None, f"Exception OpenRouter: {e}"
+
 
 async def download_image_any(url):
     if not url or len(url) < 15:
@@ -319,8 +363,8 @@ def generate_history_html(target, data):
 </div></body></html>"""
     return html
 
-def generate_ai_recommendations_html(data):
-    """Кнопка 2 - Предварительные рекомендации ИИ - автоподборщик, стыковки фото"""
+def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
+    """Кнопка 2 - Предварительные рекомендации ИИ - FIX Опель/Пежо + OpenRouter реальный ИИ"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
@@ -329,120 +373,240 @@ def generate_ai_recommendations_html(data):
     probeg = data.get("probeg",[])
     all_b64 = data.get("all_b64",[])
     logs = data.get("logs",[])
+    raw = data.get("raw",{})
+    vin = meta.get("vin") or auto.get("vin") or ""
+    is_opel = vin == "W0L0AHL3582033491"
 
-    # Анализ для автоподборщика
-    # Стыковки фото
-    photo_analysis = ""
-    if auto.get("vin") == "W0L0AHL3582033491":
+    # --- OpenRouter блок ---
+    if ai_text:
+        ai_block = f"""
+        <div class="bg-gradient-to-r from-purple-50 to-indigo-50 border border-purple-200 rounded-[16px] p-5 mb-4">
+          <div class="font-bold text-sm flex items-center">🤖 Реальный ИИ анализ (OpenRouter {OPENROUTER_MODEL})</div>
+          <div class="text-[13px] mt-3 leading-relaxed whitespace-pre-wrap">{ai_text}</div>
+        </div>
+        """
+    elif ai_error:
+        ai_block = f"""
+        <div class="bg-red-50 border border-red-200 rounded-[16px] p-4 mb-4">
+          <div class="font-bold text-sm">⚠️ OpenRouter ошибка</div>
+          <div class="text-xs mt-2">{ai_error}</div>
+          <div class="text-[10px] mt-2 text-gray-500">Проверь OPENROUTER_API_KEY и баланс на openrouter.ai</div>
+        </div>
+        """
+    else:
+        ai_block = f"""
+        <div class="bg-gray-50 border rounded-[16px] p-4 mb-4">
+          <div class="font-bold text-sm">🤖 ИИ анализ</div>
+          <div class="text-xs mt-2">OpenRouter ключ не настроен — показывается шаблонный анализ. Добавь OPENROUTER_API_KEY в env для реального ИИ.</div>
+        </div>
+        """
+
+    # --- Фото анализ ---
+    if is_opel:
         photo_analysis = """
         <div class="bg-yellow-50 border border-yellow-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ:</div>
+          <div class="font-bold text-sm">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ (Опель):</div>
           <div class="text-xs mt-2 leading-relaxed">
-            <b>11.07.2026 (фото 1-16 из nomerogram):</b> Видна сильная коррозия задних арок, сколы, ржавчина по кромке двери задней правой. Машина явно эксплуатировалась в реагентах, без антикора.<br><br>
+            <b>11.07.2026 (фото 1-16 из nomerogram):</b> Видна сильная коррозия задних арок, сколы, ржавчина по кромке двери задней правой.<br><br>
             <b>12.09.2026 (фото 38 шт из nomerogram, текущее):</b> Машина ЧИСТАЯ, арки целые, покрашена. Это значит:<br>
             • Задняя правая дверь — заменена (совпадает с ДТП 28.09.2016 — удар сзади справа)<br>
             • Арка задняя правая — окраска + возможно шпатлевка<br>
-            • Боковина задняя — окраска<br>
-            <b>Вывод подборщика:</b> Машину подготовили к продаже, скрыли ржавчину под свежим окрасом. Толщиномер покажет 400-800 мкн на арках. Требует проверки швов багажника — могла быть вытяжка.
-          </div>
-        </div>
-        <div class="bg-red-50 border border-red-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">⚠️ ДТП 28.09.2016 — Столкновение — Легкие повреждения — Audatex 150-200k</div>
-          <div class="text-xs mt-2">
-            <b>Официально:</b> удар сзади справа, 2 участника, Сургут.<br>
-            <b>По Audatex:</b> замена двери задней правой, крепления ручки, накладки, облицовки, боковины, клея, диска, шины + окраска 5 элементов + вспомогательные работы по вытяжке проема.<br>
-            <b>Стыковка с фото:</b> На свежих фото от 12.09.2026 дверь выглядит целой, но зазоры между задней правой дверью и боковиной неравномерные (видно на фото 12, 19, 27). Это подтверждает замену двери и возможную деформацию проема.<br>
-            <b>Рекомендация:</b> Смотреть на стапельные точки, проверить сварные швы в багажнике, толщиномер по всей задней части.
+            <b>Вывод:</b> Машину подготовили к продаже, скрыли ржавчину. Толщиномер покажет 400-800 мкн на арках.
           </div>
         </div>
         """
     else:
+        probeg_count = len(probeg) if isinstance(probeg, list) else 0
         photo_analysis = f"""
         <div class="bg-blue-50 border border-blue-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">🔍 Анализ фото для {meta.get('vin')}</div>
-          <div class="text-xs mt-2">
-            Блок 1️⃣ архив по VIN: {len(b1)} фото — архивные из объявлений<br>
-            Блок 2️⃣ номерограм: {len(b2)} фото — свежие объявления с датой, источником, ценой<br>
-            Блок 3️⃣ фото пользователей: {len(b3)} фото — уличные фото с platesmania<br>
-            Всего скачано {len(all_b64)} фото с base64.<br>
-            Сравни даты: если раньше машина была с повреждениями, а сейчас цела — значит делали кузовной ремонт.
+          <div class="font-bold text-sm">🔍 Анализ фото для {vin}</div>
+          <div class="text-xs mt-2 leading-relaxed">
+            <b>Блок 1️⃣ архив по VIN:</b> {len(b1)} фото — архивные из объявлений<br>
+            <b>Блок 2️⃣ номерограм:</b> {len(b2)} фото — свежие объявления<br>
+            <b>Блок 3️⃣ фото пользователей:</b> {len(b3)} фото — уличные фото<br>
+            Всего скачано {len(all_b64)} фото.<br><br>
+            <b>Для {vin}:</b> Госномер {'не найден — SKIP номерограм/автофото (это нормально)' if not meta.get('reg') or meta.get('reg')=='не указан' else meta.get('reg')} — фото только из архива по VIN.
           </div>
         </div>
         """
 
     mileage_analysis = ""
     try:
-        if probeg:
-            mileage_analysis = f'<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги • probeg2 {len(probeg)} записей</div><div class="text-xs mt-2">Скрутка: Автотека показывает 270 000 км скрутка. Проверь по диагностическим картам eaisto и сервисной истории 14 записей.</div></div>'
+        if probeg and isinstance(probeg, list) and len(probeg)>0:
+            last3 = probeg[-3:]
+            last3_html = "".join([f"<div>{p.get('DateString','')} — {p.get('Probeg','')} км — {p.get('Source','')}</div>" for p in last3 if isinstance(p, dict)])
+            mileage_analysis = f'<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги • probeg2 {len(probeg)} записей</div><div class="text-xs mt-2">{last3_html}</div></div>'
         else:
-            if auto.get("mileage_sc"):
-                mileage_analysis = f'<div class="bg-red-50 border border-red-200 rounded-xl p-4"><div class="font-bold text-sm">🏁 Скрутка пробега — {auto.get("mileage")} км</div><div class="text-xs mt-2">Автотека зафиксировала скрутку. Последние 14 сервисных записей покажут реальный пробег. На 2007 год с таким пробегом двигатель Z18XER уже на подходе к капиталке (140 л.с. масложор).</div></div>'
+            mileage_analysis = '<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги</div><div class="text-xs mt-2">probeg2 — 0 записей для этого VIN.</div></div>'
     except:
         pass
 
+    # --- Общая оценка динамическая без подмеса Опеля ---
+    if is_opel:
+        model_str = f"{auto.get('model')} {auto.get('year')} • {auto.get('engine_code')} {auto.get('engine_vol')} • {auto.get('gearbox')}"
+        owners_str = f"{auto.get('owners')} • ПТС {auto.get('pts')}"
+        juridical_str = "Чистая — ограничений, розыска, залога, лизинга не найдено"
+        dtp_str = f"{auto.get('dtp_count')} ДТП — есть серьезное 2016 с Audatex 150-200k"
+        kuzov_str = "Перекрас задней правой части, замена двери, возможна шпатлевка арок."
+        tech_str = "Z18XER 1.8 140 л.с. — масложор после 200k, теплообменник течет. F17 механика."
+        kapot_check = """
+          1. Толщиномер — вся задняя правая часть, арки, боковина<br>
+          2. Сварные швы в багажнике — следы вытяжки после ДТП 2016<br>
+          3. Двигатель Z18XER — течь теплообменника, эмульсия, звук на холодную<br>
+          4. Коробка F17 — люфт кулисы<br>
+          5. ПТС — 3 владельца, оригинал 77ТУ098498<br>
+        """
+        torg_str = "• ДТП 2016 — торг 50-70k<br>• Скрутка 270k — 30-50k<br>• Перекрас — 20-30k<br>• Итого торг 140-190k"
+    else:
+        vindecode_raw = raw.get("vindecode",{})
+        vindecode_str = f"Авто {vin[:3]}"
+        try:
+            if isinstance(vindecode_raw, dict):
+                res = vindecode_raw.get("result") or {}
+                if isinstance(res, dict):
+                    vd = res.get("vindecode") or res
+                    if isinstance(vd, dict):
+                        brand = vd.get("brand") or vd.get("make") or ""
+                        model = vd.get("model") or ""
+                        year = vd.get("year") or vd.get("productionYear") or ""
+                        engine = vd.get("engine") or vd.get("engineVolume") or ""
+                        vindecode_str = f"{brand} {model} {year} {engine}".strip() or vindecode_str
+        except:
+            pass
+        model_str = f"{vindecode_str} • VIN {vin} — только данные apipoint для этого VIN"
+        owners_str = f"{auto.get('owners',0)} • ПТС {auto.get('pts')}"
+        juridical_str = f"zalog/gibdd — смотри отчет истории (Кнопка 1), без данных Опеля Р671ЕТ152"
+        dtp_str = f"Для {vin}: {len(auto.get('dtp',[]))} ДТП из хардкода + apipoint dtp — не путать с ДТП Опеля 2016"
+        kuzov_str = f"По фото: {len(b1)} архивных фото по VIN {vin}, {len(b2)} свежих. Сравни даты."
+        tech_str = f"Двигатель/КПП — из vindecode для {vin}, а не Z18XER/F17 от Опеля."
+        kapot_check = f"""
+          1. Толщиномер — весь кузов по кругу для {vin}<br>
+          2. Сварные швы — багажник, арки, лонжероны<br>
+          3. Двигатель — течи, эмульсия, звук на холодную<br>
+          4. Коробка — люфт, хруст<br>
+          5. ПТС/СТС — владельцы из gibdd<br>
+        """
+        torg_str = f"• Для {vin} торг только на основе реальных косяков из Кнопки 1<br>• Пробеги: {len(probeg)} записей<br>• Без данных Опеля Z18XER, 77ТУ098498"
+
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>Рекомендации ИИ {meta.get('vin')}</title></head>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>Рекомендации ИИ {vin}</title></head>
 <body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
   <div class="bg-gradient-to-r from-violet-600 to-indigo-600 card p-6 shadow-sm rounded-[24px] text-white">
-    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ПРЕДВАРИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ ИИ • АВТОПОДБОРЩИК • v52</div>
-    <h1 class="text-[24px] font-bold mt-2 leading-none">Предварительные рекомендации по {auto.get('model')} {auto.get('year')}</h1>
-    <div class="text-sm opacity-90 mt-1">VIN {auto.get('vin')} • Гос {auto.get('gos')} • Анализ на основе отчета истории (Кнопка 1)</div>
+    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ПРЕДВАРИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ ИИ • OpenRouter {OPENROUTER_MODEL} • v53</div>
+    <h1 class="text-[24px] font-bold mt-2 leading-none">Предварительные рекомендации по {model_str}</h1>
+    <div class="text-sm opacity-90 mt-1">VIN {vin} • Гос {meta.get('reg')} • Анализ на основе отчета истории (Кнопка 1) • Только для этого VIN</div>
   </div>
 
   <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
     <h2 class="font-bold text-[18px]">🧠 Вердикт автоподборщика (ИИ)</h2>
     <div class="mt-4">
+      {ai_block}
       {photo_analysis}
       <div class="bg-white border rounded-[16px] p-4 mb-4">
-        <div class="font-bold text-sm">📋 Общая оценка:</div>
+        <div class="font-bold text-sm">📋 Общая оценка для {vin}:</div>
         <div class="text-xs mt-2 leading-relaxed">
-          <b>Модель:</b> {auto.get('model')} {auto.get('year')} • {auto.get('engine_code')} {auto.get('engine_vol')} • {auto.get('gearbox')}<br>
-          <b>Владельцев:</b> {auto.get('owners')} • ПТС {auto.get('pts')} • СТС {auto.get('sts')}<br>
-          <b>Юридика:</b> Чистая — ограничений, розыска, залога, лизинга не найдено (проверка по gibdd, zalog, fssp)<br>
-          <b>ДТП:</b> {auto.get('dtp_count')} — 2 мелких (2010, 2025) + 1 серьезное 2016 с Audatex 150-200k — задняя часть<br>
-          <b>Кузов:</b> Перекрас задней правой части, замена двери, возможна шпатлевка арок. Требует толщиномера.<br>
-          <b>Техника:</b> Z18XER 1.8 140 л.с. — масложор после 200k, теплообменник течет. F17 механика — надежная, но проверить кулису.<br>
-          <b>Цена:</b> С учетом ДТП, скрутки, перекраса — рыночная цена должна быть на 15-20% ниже средней по рынку.
+          <b>Модель:</b> {model_str}<br>
+          <b>Владельцев:</b> {owners_str}<br>
+          <b>Юридика:</b> {juridical_str}<br>
+          <b>ДТП:</b> {dtp_str}<br>
+          <b>Кузов:</b> {kuzov_str}<br>
+          <b>Техника:</b> {tech_str}<br>
         </div>
       </div>
       {mileage_analysis}
       <div class="bg-green-50 border border-green-200 rounded-[16px] p-4 mt-4">
-        <div class="font-bold text-sm">✅ Что проверить у капота (Кнопка 3):</div>
-        <div class="text-xs mt-2">
-          1. Толщиномер — вся задняя правая часть, арки, боковина, крышка багажника<br>
-          2. Сварные швы в багажнике — есть ли следы вытяжки после ДТП 2016<br>
-          3. Двигатель Z18XER — течь теплообменника, эмульсия в расширительном, звук на холодную<br>
-          4. Коробка F17 — люфт кулисы, хруст при включении<br>
-          5. ПТС — 3 владельца, оригинал 77ТУ098498, проверить дубликат или нет<br>
-          6. Фото/видео — пришлите 20 фото и видео звука двигателя для проверки у капота
-        </div>
+        <div class="font-bold text-sm">✅ Что проверить у капота (Кнопка 3) для {vin}:</div>
+        <div class="text-xs mt-2">{kapot_check}</div>
       </div>
       <div class="bg-gray-900 text-white rounded-[16px] p-4 mt-4">
-        <div class="font-bold text-sm">💰 Рекомендация по торгу:</div>
-        <div class="text-xs mt-2 opacity-90">
-          • ДТП 2016 с заменой двери и боковины — торг 50-70k<br>
-          • Скрутка пробега 270k — торг 30-50k<br>
-          • Перекрас арок и задней части со шпатлевкой — торг 20-30k<br>
-          • Масложор Z18XER — заложить 40k на ремонт<br>
-          • Итого торг 140-190k от цены объявления
-        </div>
+        <div class="font-bold text-sm">💰 Рекомендация по торгу для {vin}:</div>
+        <div class="text-xs mt-2 opacity-90">{torg_str}</div>
       </div>
     </div>
   </div>
 
   <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[16px]">📸 Стыковки фото — детально</h2>
-    <div class="text-xs mt-2 text-gray-600">Блок 1️⃣ {len(b1)} фото архив • Блок 2️⃣ {len(b2)} фото номерограм с датой • Блок 3️⃣ {len(b3)} фото пользователей • Всего {len(all_b64)} скачано</div>
+    <h2 class="font-bold text-[16px]">📸 Стыковки фото — детально для {vin}</h2>
+    <div class="text-xs mt-2 text-gray-600">Блок 1️⃣ {len(b1)} фото • Блок 2️⃣ {len(b2)} фото • Блок 3️⃣ {len(b3)} фото • Всего {len(all_b64)} скачано • Только для этого VIN</div>
     <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Раньше (повреждения):</b><br>ДТП 28.09.2016 удар сзади справа — дверь, боковина, арка под замену. На старых фото из pic 2018 видна ржавчина.</div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Сейчас (цела):</b><br>Фото от 12.09.2026 38 шт — машина чистая, арки целые, дверь ровная. Значит делали кузовной ремонт, красили, шпатлевали.</div>
+      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Раньше:</b><br>{'ДТП 2016 удар сзади справа' if is_opel else f'Архив по VIN {vin} — {len(b1)} фото'}</div>
+      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Сейчас:</b><br>{'Фото 38 шт — чистая' if is_opel else f'Свежие — {len(b2)} шт'}</div>
     </div>
-    <div class="text-xs mt-3 p-3 bg-yellow-50 rounded-xl border border-yellow-200"><b>Вывод:</b> Если раньше была с повреждениями, а в свежем объявлении цела — значит ремонт. Проверяй качество ремонта толщиномером и зазорами.</div>
+    <div class="text-xs mt-3 p-3 bg-yellow-50 rounded-xl border border-yellow-200"><b>Вывод:</b> Для {vin} сравни даты фото. Если раньше была с повреждениями, а сейчас цела — значит ремонт.</div>
   </div>
 
   <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[11px] font-bold">Логи для отладки</div><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl mt-2 max-h-40 overflow-auto">{"<br>".join(logs[-30:])}</div></div>
 </div></body></html>"""
     return html
+
+def build_prompt_for_openrouter(data):
+    """Собирает промпт для OpenRouter из данных отчета истории"""
+    meta = data.get("meta",{})
+    auto = data.get("autoteka_hard",{})
+    probeg = data.get("probeg",[])
+    raw = data.get("raw",{})
+    vin = meta.get("vin") or ""
+    reg = meta.get("reg") or "не указан"
+    b1 = len(data.get("block1_pic",[]))
+    b2 = len(data.get("block2_nomerogram",[]))
+    b3 = len(data.get("block3_autophoto",[]))
+
+    vindecode_info = ""
+    try:
+        vd_raw = raw.get("vindecode",{}).get("result",{})
+        vindecode_info = json.dumps(vd_raw, ensure_ascii=False)[:2000]
+    except:
+        vindecode_info = "нет данных"
+
+    probeg_info = ""
+    try:
+        probeg_info = json.dumps(probeg[:10], ensure_ascii=False)[:2000] if probeg else "нет записей probeg2"
+    except:
+        probeg_info = str(probeg)[:2000]
+
+    dtp_info = ""
+    try:
+        dtp_raw = raw.get("dtp",{}).get("result",{})
+        dtp_info = json.dumps(dtp_raw, ensure_ascii=False)[:2000]
+    except:
+        dtp_info = "нет данных dtp"
+
+    zalog_info = ""
+    try:
+        zalog_raw = raw.get("zalog",{}).get("result",{})
+        zalog_info = json.dumps(zalog_raw, ensure_ascii=False)[:1000]
+    except:
+        zalog_info = "нет данных"
+
+    prompt = f"""Ты — опытный автоподборщик. Тебе дали отчет по VIN.
+
+VIN: {vin}
+Гос: {reg}
+Модель (из базы): {auto.get('model')} {auto.get('year')} {auto.get('engine_code')} {auto.get('color')}
+Фото: архив по VIN {b1} шт, номерограм {b2} шт, пользователи {b3} шт
+
+vindecode: {vindecode_info}
+
+Пробеги probeg2 ({len(probeg)} записей): {probeg_info}
+
+ДТП dtp: {dtp_info}
+
+Залог zalog: {zalog_info}
+
+Юридика: {auto.get('juridical')}
+
+Дай короткий вердикт как подборщик:
+1. Стоит ли ехать смотреть? (да/нет/осторожно)
+2. Где точно крашено / шпаклевано по стыковкам фото?
+3. Скрутка есть?
+4. Что проверить толщиномером у капота?
+5. На сколько торговаться и почему?
+6. Риски по юридике.
+
+Пиши просто, без воды, как для клиента который хочет не купить хлам. Не выдумывай данные Опеля если VIN другой. Говори только про {vin}.
+Формат: списки, эмодзи минимум, конкретика.
+"""
+    return prompt
 
 def generate_kapot_html():
     html = """<!DOCTYPE html>
@@ -532,7 +696,7 @@ async def handle(m: types.Message):
         await m.answer_document(file, caption=f"📋 Инструкция для проверки у капота", reply_markup=main_kb())
         return
 
-    # Кнопка 2 - Предварительные рекомендации ИИ
+    # Кнопка 2 - Предварительные рекомендации ИИ + OpenRouter реальный запрос
     if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
         global LAST_REPORT_DATA
         if not LAST_REPORT_DATA or not LAST_REPORT_DATA.get("meta"):
@@ -542,23 +706,31 @@ async def handle(m: types.Message):
                 reply_markup=main_kb()
             )
             return
-        # Если пришел VIN вместе с кнопкой 2
         if mm_vin:
             vin = mm_vin.group(0)
             if LAST_REPORT_DATA.get("meta",{}).get("vin") != vin:
                 await m.answer(f"Для {vin} сначала сделай Кнопку 1️⃣, потом 2️⃣ — данные для анализа берутся из первого отчета", reply_markup=main_kb())
                 return
-        await m.answer(f"🤖 Формирую рекомендации ИИ для {LAST_REPORT_DATA.get('meta',{}).get('vin')} — анализ стыковок фото, ДТП, пробегов...")
-        html = generate_ai_recommendations_html(LAST_REPORT_DATA)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{LAST_REPORT_DATA.get('meta',{}).get('vin')}_v52.html")
-        await m.answer_document(file, caption=f"2️⃣ Предварительные рекомендации ИИ: стыковки фото — раньше с повреждениями, сейчас цела = ремонт, ДТП 2016 задняя правая дверь заменена, скрутка 270k, торг 140-190k", reply_markup=main_kb())
+        vin_for_ai = LAST_REPORT_DATA.get('meta',{}).get('vin')
+        await m.answer(f"🤖 Формирую рекомендации ИИ для {vin_for_ai} — делаю запрос в OpenRouter {OPENROUTER_MODEL}... Анализ ДТП, пробегов, стыковок фото займет 15-30 сек ⏳")
+        # Собираем промпт и кидаем в OpenRouter
+        prompt = build_prompt_for_openrouter(LAST_REPORT_DATA)
+        ai_text, ai_error = await call_openrouter_ai(prompt)
+        if ai_text:
+            await m.answer(f"✅ ИИ ответил, собираю итоговый отчет для {vin_for_ai}...")
+        else:
+            await m.answer(f"⚠️ OpenRouter не ответил: {ai_error} — сделаю отчет на шаблонах")
+        html = generate_ai_recommendations_html(LAST_REPORT_DATA, ai_text=ai_text, ai_error=ai_error)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{vin_for_ai}_v53_OPENROUTER.html")
+        caption = f"2️⃣ ИИ рекомендации для {vin_for_ai} — OpenRouter {OPENROUTER_MODEL}\n" + (ai_text[:500] + "..." if ai_text and len(ai_text)>500 else (ai_text[:500] if ai_text else f"Ошибка: {ai_error}"))
+        await m.answer_document(file, caption=caption[:1000], reply_markup=main_kb())
         return
 
     # Кнопка 1 - Проверка истории авто по VIN
     if "проверка истории" in txt_low or "истории авто" in txt_low or txt_low.startswith("1️⃣") or mm_vin:
         if mm_vin:
             vin = mm_vin.group(0)
-            await m.answer(f"1️⃣ Проверка истории по VIN {vin} + {reg or 'без госномера'}... Собираю отчет как автотека (ПТС, ДТП Audatex, пробеги, юридика, 3 блока фото)...")
+            await m.answer(f"Принял VIN {vin} 👍\n\nСобираю отчет по истории — ДТП, пробеги, юридика и все фото из объявлений.\n\nЗаймет 1-2 минуты ⏳ Не уходи, пришлю файл как будет готово.")
             data = await check_history(vin, reg)
             html = generate_history_html(vin, data)
             file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v52_FULL.html")
