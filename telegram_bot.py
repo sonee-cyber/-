@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-v39 - обход carPhoto 500 через оригинальные URL из nomerogram.rez[].url
-Каждая запись nomerogram имеет поле url - это ссылка на объявление где фото нашли.
-Парсим эту страницу напрямую, а не apipoint carPhoto.
+v41 - используем autophoto вместо nomerogram/carPhoto
+autophoto отдает прямые ссылки на platesmania.com без токена и без 500
+Цена 1.60р, возвращает urlphoto и bigPhoto - можно качать напрямую
 """
 import asyncio, os, re, json, base64
 from datetime import datetime
@@ -13,7 +13,7 @@ APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or ""
 APIPOINT_KEY = APIPOINT_KEY.strip()
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v39 BYPASS via nomerogram.url source pages")
+print(f"BOOT v41 AUTOPHOTO - platesmania.com bypass carPhoto 500")
 
 async def apipoint_call(payload):
     headers = {"Authorization": f"Bearer {APIPOINT_KEY}", "Content-Type": "application/json"}
@@ -21,191 +21,155 @@ async def apipoint_call(payload):
         try:
             async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=45) as resp:
                 txt = await resp.text()
-                print(f"[APIPOINT] {payload.get('sources')} -> {resp.status}")
+                print(f"[APIPOINT] {payload.get('sources')} {payload.get('regNum') or payload.get('vin','')} -> {resp.status}")
                 try:
                     data = json.loads(txt)
                 except:
-                    data = {"raw": txt[:1000]}
-                return resp.status, data
+                    data = {"raw": txt[:5000]}
+                return resp.status, data, txt[:8000]
         except Exception as e:
-            return 0, {"error": str(e)}
+            return 0, {"error": str(e)}, str(e)
 
-async def download_image_simple(url):
-    if not url or len(url) < 15:
+async def download_platesmania_photo(url):
+    """Качаем фото с platesmania.com напрямую без токена"""
+    if not url or "platesmania.com" not in url and "img" not in url:
+        # autophoto может отдать и другие домены, пробуем любой
+        pass
+    if not url or len(url) < 10:
         return None
-    # Пропускаем логотипы
-    if any(x in url.lower() for x in ["logo", "icon", "og/", "apple-touch", "favicon", "banner", "gibddlogo"]):
+    if any(x in url.lower() for x in ["logo", "icon", "favicon"]):
         return None
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://auto.ru/"
+        "Referer": "https://platesmania.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*"
     }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=20, allow_redirects=True) as resp:
                 ct = resp.headers.get("Content-Type","").lower()
-                if resp.status == 200 and ("image" in ct or "octet" in ct):
+                if resp.status == 200 and ("image" in ct or "octet" in ct or "jpeg" in ct or "jpg" in ct):
                     content = await resp.read()
-                    if len(content) > 8000:  # больше 8кб - точно фото машины, не иконка
+                    if len(content) > 5000:
                         b64 = base64.b64encode(content).decode('utf-8')
                         mime = "image/jpeg"
                         if "png" in ct:
                             mime = "image/png"
+                        print(f"[DL OK] {url[:70]} {len(content)} bytes")
                         return f"data:{mime};base64,{b64}"
+                    else:
+                        print(f"[DL SMALL] {url[:70]} {len(content)}")
     except Exception as e:
-        print(f"[DL FAIL] {url[:70]} {e}")
+        print(f"[DL EXC] {url[:70]} {e}")
     return None
 
-async def fetch_photos_from_source_page(source_url):
-    """Берем оригинальное объявление (auto.ru, drom.ru, avito) и вытаскиваем фото"""
-    if not source_url or len(source_url) < 10:
-        return []
-
-    print(f"[SOURCE PAGE] Fetch {source_url[:80]}")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
-        "Referer": "https://www.google.com/"
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(source_url, headers=headers, timeout=25, allow_redirects=True) as resp:
-                print(f"[SOURCE PAGE] {source_url[:60]} -> {resp.status}")
-                if resp.status != 200:
-                    return []
-                html = await resp.text()
-
-                found = set()
-
-                # Паттерны для фото на разных площадках
-                patterns = [
-                    r'https?://[^"\']*auto\.ru[^"\']*\.(?:jpg|jpeg|png)',  # auto.ru
-                    r'https?://[^"\']*avito\.ru[^"\']*\.(?:jpg|jpeg|png)',  # avito (хотя 2018 удалены)
-                    r'https?://[^"\']*drom\.ru[^"\']*\.(?:jpg|jpeg|png)',
-                    r'https?://[^"\']*youla\.ru[^"\']*\.(?:jpg|jpeg|png)',
-                    r'https?://[^"\']*cs\d*\.drom\.ru[^"\']*\.(?:jpg|jpeg|png)',
-                    r'https?://[^"\']*autoru\.[^"\']*\.(?:jpg|jpeg|png)',
-                    r'https?://[^"\']*img\.auto\.ru[^"\']*\.(?:jpg|jpeg|png)',
-                    # JSON с фото
-                    r'"url"\s*:\s*"(https://[^"]+\.(?:jpg|jpeg|png))"',
-                    r'"src"\s*:\s*"(https://[^"]+\.(?:jpg|jpeg|png))"',
-                    r'https://[^\s"\']+\.jpg',
-                ]
-
-                for pat in patterns:
-                    for m in re.findall(pat, html, re.IGNORECASE):
-                        # m может быть кортежем
-                        if isinstance(m, tuple):
-                            m = m[0]
-                        url = m.split('?')[0].split('#')[0]
-                        # Фильтруем мусор
-                        if len(url) < 20:
-                            continue
-                        if any(bad in url.lower() for bad in ["logo", "icon", "favicon", "banner", "gibdd", "og/drom", "apple-touch", "static", "sprite", "1x1", "pixel", "tracker"]):
-                            continue
-                        # Должно быть похоже на фото авто (содержит цифры, размеры)
-                        if ".jpg" in url.lower() or ".jpeg" in url.lower() or ".png" in url.lower():
-                            found.add(url)
-
-                # Убираем дубли и берем первые 20
-                photos = list(found)[:20]
-                print(f"[SOURCE PAGE] Found {len(photos)} photos in {source_url[:50]}")
-                for p in photos[:3]:
-                    print(f"  - {p[:100]}")
-
-                return photos
-    except Exception as e:
-        print(f"[SOURCE PAGE EXC] {source_url[:60]} {e}")
-        return []
-
-async def check_v39(vin):
-    combined = {"result": {}, "meta": {}, "b64_images": [], "offers": [], "nomerogram_fresh": [], "logs": []}
+async def check_v41(vin, reg_num="Р671ЕТ152"):
+    combined = {"result": {}, "meta": {}, "autophoto": {}, "raw_autophoto": None, "b64_images": [], "logs": [], "offers": []}
     logs = combined["logs"]
 
-    year = 2007
+    year = 2008
     try:
         codes = {'A':2010,'B':2011,'C':2012,'D':2013,'E':2014,'F':2015,'G':2016,'H':2017,'J':2018,'K':2019,'L':2020,'M':2021,'N':2022,'P':2023,'R':2024,'1':2001,'2':2002,'3':2003,'4':2004,'5':2005,'6':2006,'7':2007,'8':2008,'9':2009}
         year = codes.get(vin[9].upper(), 2007)
     except:
         pass
     combined["meta"]["detected_year"] = year
+    combined["meta"]["regNum"] = reg_num
 
-    calls = [
-        {"sources": "nomerogram", "regNum": "Р671ЕТ152"},
-        {"sources": "offerbyvin", "vin": vin},
-        {"sources": "probeg2", "vin": vin},
-        {"sources": "vindecode", "vin": vin},
-    ]
-    for payload in calls:
-        status, data = await apipoint_call(payload)
-        if isinstance(data, dict):
-            res = data.get("result") or {}
-            src = payload["sources"]
-            combined["result"][src] = res.get(src) or res
+    # 1. autophoto - главный источник фото без carPhoto 500
+    status, data, raw_txt = await apipoint_call({"sources": "autophoto", "regNum": reg_num})
+    combined["raw_autophoto"] = data
+    combined["raw_autophoto_text"] = raw_txt
+    logs.append(f"autophoto {reg_num} -> {status}")
 
-    # Разбираем nomerogram
-    nom_fresh = []
+    # Парсим autophoto
+    b64_images = []
+    autophoto_records = []
     try:
-        nom = combined["result"].get("nomerogram",{})
-        rez = []
-        if isinstance(nom.get("result"), dict):
-            rez = nom["result"].get("rez",[])
-        elif isinstance(nom.get("rez"), list):
-            rez = nom.get("rez",[])
+        result = data.get("result") or {}
+        ap = result.get("autophoto") or result
+        records = []
+        if isinstance(ap, dict):
+            if isinstance(ap.get("records"), list):
+                records = ap.get("records")
+            elif isinstance(ap.get("result"), list):
+                records = ap.get("result")
+            elif isinstance(ap, list):
+                records = ap
 
-        print(f"[NOMEROGRAM] rez count {len(rez)}")
+        print(f"[AUTOPHOTO] records {len(records)}")
+        logs.append(f"autophoto records {len(records)}")
 
-        for r in rez[:5]:  # берем 5 свежих
-            if isinstance(r, dict):
-                source_url = r.get("url") or ""
-                date = r.get("date") or ""
-                carphoto_urls = r.get("img",[]) or []  # эти 500 - не качаем
+        for rec in records[:15]:
+            if isinstance(rec, dict):
+                urlphoto = rec.get("urlphoto") or rec.get("urlPhoto") or ""
+                bigphoto = rec.get("bigPhoto") or rec.get("bigphoto") or ""
+                urlnumber = rec.get("urlNumber") or ""
+                date = rec.get("date") or rec.get("addDate") or rec.get("created") or ""
+                name = rec.get("name") or ""
 
-                logs.append(f"Обрабатываю {date} source_url={source_url[:60]} carPhoto={len(carphoto_urls)} шт (500)")
+                # Берем bigPhoto если есть, иначе urlphoto
+                best_url = bigphoto or urlphoto
 
-                # Пробуем вытащить фото с оригинальной страницы
-                real_photos = []
-                if source_url:
-                    real_photos = await fetch_photos_from_source_page(source_url)
-
-                # Качаем реальные фото как base64
-                b64_list = []
-                for photo_url in real_photos[:10]:
-                    b64 = await download_image_simple(photo_url)
-                    if b64:
-                        b64_list.append(b64)
-                        logs.append(f"OK {photo_url[:60]}")
-                    else:
-                        logs.append(f"FAIL {photo_url[:60]}")
-
-                nom_fresh.append({
+                autophoto_records.append({
                     "date": date,
-                    "source_url": source_url,
-                    "carphoto_urls": carphoto_urls,  # эти 500
-                    "real_photos": real_photos,
-                    "b64_images": b64_list,
-                    "source": f"nomerogram {date} - оригинал {source_url[:50]}",
-                    "descr": f"Фото с оригинального объявления {source_url[:80]} — {len(real_photos)} найдено, {len(b64_list)} скачано. carPhoto {len(carphoto_urls)} шт сейчас 500."
+                    "name": name,
+                    "urlphoto": urlphoto,
+                    "bigPhoto": bigphoto,
+                    "urlNumber": urlnumber,
+                    "best_url": best_url
                 })
 
+                if best_url:
+                    b64 = await download_platesmania_photo(best_url)
+                    if b64:
+                        b64_images.append(b64)
+                        logs.append(f"DL OK autophoto {date} {best_url[:60]}")
+                    else:
+                        # пробуем второй вариант
+                        if urlphoto and urlphoto != best_url:
+                            b64_2 = await download_platesmania_photo(urlphoto)
+                            if b64_2:
+                                b64_images.append(b64_2)
+                                logs.append(f"DL OK autophoto fallback {urlphoto[:60]}")
+                            else:
+                                logs.append(f"DL FAIL {best_url[:60]}")
+                        else:
+                            logs.append(f"DL FAIL {best_url[:60]}")
+
     except Exception as e:
-        logs.append(f"nomerogram err {e}")
-        import traceback
-        traceback.print_exc()
+        logs.append(f"autophoto parse err {e}")
+        import traceback; traceback.print_exc()
 
-    combined["nomerogram_fresh"] = nom_fresh
-    combined["b64_images"] = [b64 for nf in nom_fresh for b64 in nf.get("b64_images",[])]
+    combined["autophoto"]["records"] = autophoto_records
+    combined["b64_images"] = b64_images
 
-    # Старые
-    offers = []
+    # 2. Сухие факты
+    for src in ["probeg2", "vindecode", "zalog", "dtp"]:
+        status, data_src, _ = await apipoint_call({"sources": src, "vin": vin})
+        combined["result"][src] = data_src.get("result") if isinstance(data_src, dict) else {}
+
+    # 3. offerbyvin старые
+    status, data_off, _ = await apipoint_call({"sources": "offerbyvin", "vin": vin})
+    combined["result"]["offerbyvin"] = data_off.get("result") if isinstance(data_off, dict) else {}
     try:
-        oc = combined["result"].get("offerbyvin",{})
-        olist = oc.get("result",{}).get("offerList") or oc.get("offerList") or []
-        for item in olist[:2]:
+        offer = combined["result"]["offerbyvin"].get("offerbyvin") if isinstance(combined["result"]["offerbyvin"], dict) else {}
+        if isinstance(offer, dict) and isinstance(offer.get("result"), dict):
+            offer_list = offer["result"].get("offerList") or []
+        elif isinstance(combined["result"]["offerbyvin"], dict):
+            inner = combined["result"]["offerbyvin"]
+            if isinstance(inner.get("result"), dict):
+                offer_list = inner["result"].get("offerList") or []
+            elif "offerList" in inner:
+                offer_list = inner["offerList"]
+            else:
+                offer_list = []
+        else:
+            offer_list = []
+
+        offers = []
+        for item in offer_list[:3]:
             if isinstance(item, dict):
                 offers.append({
                     "date": item.get("Credate",""),
@@ -214,51 +178,51 @@ async def check_v39(vin):
                     "descr": item.get("Descr","")[:400],
                     "source": "offerbyvin 2018"
                 })
+        combined["offers"] = offers
     except:
-        pass
-    combined["offers"] = offers
+        combined["offers"] = []
 
     return combined
 
-def generate_html_v39(target, data):
-    nom_fresh = data.get("nomerogram_fresh",[])
+def generate_html_v41(target, data):
     b64_images = data.get("b64_images",[])
+    autophoto = data.get("autophoto",{})
+    records = autophoto.get("records",[])
+    raw_autophoto = data.get("raw_autophoto")
+    raw_text = data.get("raw_autophoto_text","")[:8000]
     logs = data.get("logs",[])
     meta = data.get("meta",{})
     year = meta.get("detected_year")
+    reg_num = meta.get("regNum")
+    result = data.get("result",{})
+    offers = data.get("offers",[])
 
+    raw_pretty = json.dumps(raw_autophoto, ensure_ascii=False, indent=2)[:15000] if raw_autophoto else "Нет данных"
     logs_html = "<br>".join([f"<div class='text-[10px] font-mono bg-gray-50 p-1 mb-1 rounded'>{l}</div>" for l in logs[-50:]])
 
-    ads_html = ""
-    for ad in nom_fresh:
-        b64_list = ad.get("b64_images",[])
-        real_photos = ad.get("real_photos",[])
-        carphoto_urls = ad.get("carphoto_urls",[])
+    gallery_html = "".join([f'<img src="{b64}" class="w-full h-56 object-cover rounded-xl border shadow-sm" loading="lazy" />' for b64 in b64_images]) or f"<div class='text-sm text-gray-500'>Нет фото с autophoto для {reg_num}. Возможно госномер не засветился на platesmania.com. Попробуй другой госномер этого VIN.</div>"
 
-        if b64_list:
-            photos_html = "".join([f'<img src="{b64}" class="w-full h-40 object-cover rounded-xl border" loading="lazy" />' for b64 in b64_list[:12]])
-        else:
-            # Показываем что нашли в оригинале
-            links = "".join([f"<a href='{u}' target='_blank' class='text-[10px] text-blue-600 block break-all'>{u[:100]}</a>" for u in real_photos[:5]])
-            photos_html = f"<div class='text-xs bg-yellow-50 border border-yellow-200 p-3 rounded-xl'>На оригинальной странице {ad.get('source_url')[:60]} найдено {len(real_photos)} фото, но скачать не удалось (блокировка).<br>Ссылки:<br>{links or 'Не найдено'}<br><br>carPhoto {len(carphoto_urls)} шт сейчас 500 — это apipoint лежит.</div>"
-
-        ads_html += f"""
-        <div class="border rounded-2xl p-4 mb-5 bg-white shadow-sm">
-            <div class="font-bold text-sm">{ad.get('date','')[:16]} • {ad.get('source')}</div>
-            <a href="{ad.get('source_url','')}" class="text-xs text-blue-600 break-all">{ad.get('source_url','')[:120]}</a>
-            <div class="text-xs bg-gray-50 p-2 rounded-xl mt-2 border">{ad.get('descr','')[:400]}</div>
-            <div class="grid grid-cols-2 md:grid-cols-3 gap-2 mt-3">{photos_html}</div>
-            <div class="text-[10px] mt-2 text-green-600">✅ Скачано {len(b64_list)} / найдено {len(real_photos)} с оригинала | carPhoto {len(carphoto_urls)} шт — 500</div>
+    records_html = ""
+    for rec in records[:10]:
+        records_html += f"""
+        <div class="border rounded-xl p-3 mb-3 bg-white">
+            <div class="text-xs font-bold">{rec.get('date','')} • {rec.get('name','')}</div>
+            <div class="text-[10px] mt-1"><b>bigPhoto:</b> <a href="{rec.get('bigPhoto','')}" target="_blank" class="text-blue-600 break-all">{rec.get('bigPhoto','')[:100]}</a></div>
+            <div class="text-[10px]"><b>urlphoto:</b> <a href="{rec.get('urlphoto','')}" target="_blank" class="text-blue-600 break-all">{rec.get('urlphoto','')[:100]}</a></div>
         </div>"""
-
-    archive_html = "".join([f'<img src="{b64}" class="w-full h-48 object-cover rounded-xl border" />' for b64 in b64_images]) or "<div class='text-xs text-gray-400'>Нет фото — оригинальные страницы тоже блокируют или требуют JS. Попробуй открыть source_url в браузере вручную.</div>"
 
     probeg_html = ""
     try:
-        pc = data["result"].get("probeg2",{})
-        lst = pc.get("result") if isinstance(pc, dict) and isinstance(pc.get("result"), list) else []
-        if isinstance(data["result"].get("probeg2"), dict) and isinstance(data["result"]["probeg2"].get("result"), list):
-            lst = data["result"]["probeg2"]["result"]
+        pc = result.get("probeg2",{})
+        lst = []
+        if isinstance(pc, dict):
+            if isinstance(pc.get("result"), list):
+                lst = pc.get("result")
+            elif isinstance(pc.get("probeg2"), dict):
+                lst = pc.get("probeg2",{}).get("result",[])
+            elif isinstance(pc.get("result"), dict) and isinstance(pc["result"].get("result"), list):
+                lst = pc["result"]["result"]
+
         def parse_date_sort(s):
             try:
                 for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"]:
@@ -272,6 +236,7 @@ def generate_html_v39(target, data):
             except:
                 pass
             return datetime.min
+
         probeg_sorted = sorted([(it.get("DateString",""), it.get("Probeg",0)) for it in lst if isinstance(it, dict)], key=lambda x: parse_date_sort(x[0]))
         for d,p in probeg_sorted:
             probeg_html += f'<div class="flex gap-3 p-2 bg-gray-50 rounded-xl"><div class="text-xs w-24">{d[:10]}</div><div class="font-bold">{p} км</div></div>'
@@ -279,23 +244,41 @@ def generate_html_v39(target, data):
         probeg_html = "Нет данных"
 
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>v39 {target}</title></head>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>v41 {target} autophoto</title></head>
 <body class="bg-[#f5f5f7]"><div class="max-w-5xl mx-auto p-4">
   <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
-    <div class="text-xs text-gray-400">v39 BYPASS via source_url • VIN {target} • Год {year} • Скачано {len(b64_images)} фото с оригинальных страниц</div>
-    <h1 class="text-2xl font-bold mt-2">Фото — обход carPhoto 500 через оригинальные объявления</h1>
-    <div class="text-xs text-gray-500 mt-2">apipoint carPhoto отдает 500. Поэтому берем поле url из nomerogram.rez[] — это ссылка на auto.ru/drom/avito где фото нашли, и парсим фото оттуда напрямую.</div>
+    <div class="text-xs text-gray-400">v41 AUTOPHOTO BYPASS • VIN {target} • Гос {reg_num} • Год {year} • autophoto 1.60₽ вместо carPhoto 500 • Скачано {len(b64_images)} фото с platesmania.com</div>
+    <h1 class="text-2xl font-bold mt-2">Фото — autophoto (platesmania.com) обход carPhoto 500</h1>
+    <div class="text-xs text-gray-500 mt-2">Источник autophoto отдает прямые ссылки http://img03.platesmania.com/.../m/128929.jpg без токена и без 500. Это фото с дорог, загруженные пользователями по госномеру.</div>
   </div>
 
   <div class="bg-green-50 border border-green-200 rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold text-xl">📸 Свежие фото с оригинальных страниц (обход 500)</h2>
-    <div class="grid grid-cols-2 md:grid-cols-3 gap-3 mt-4">{archive_html}</div>
-    <div class="text-xs text-gray-500 mt-3">Всего скачано {len(b64_images)} фото с оригинальных страниц (ржавая 11.07.2026 должна быть тут)</div>
+    <h2 class="font-bold text-xl">📸 Фото с autophoto (platesmania.com) — {len(b64_images)} шт</h2>
+    <div class="text-xs text-gray-600 mt-1">Госномер {reg_num} • Скачано {len(b64_images)} / найдено {len(records)} • Без carPhoto 500</div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">{gallery_html}</div>
   </div>
 
   <div class="bg-white rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold text-xl mb-4">📢 История объявлений — откуда фото</h2>
-    {ads_html or "<div class='text-sm'>Нет данных</div>"}
+    <h2 class="font-bold text-lg mb-2">📋 autophoto records (10 шт)</h2>
+    <div class="text-xs text-gray-500 mb-2">Что вернул apipoint:</div>
+    {records_html or "<div class='text-sm'>Нет записей для этого госномера на platesmania.com</div>"}
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6">
+    <h2 class="font-bold mb-2">📦 Сырой autophoto JSON</h2>
+    <pre class="bg-gray-900 text-green-300 p-4 rounded-xl text-[10px] overflow-auto max-h-96 whitespace-pre-wrap">{raw_pretty}</pre>
+    <div class="text-xs mt-2">Raw text:</div>
+    <pre class="bg-gray-100 p-2 rounded-xl text-[10px] overflow-auto max-h-64">{raw_text}</pre>
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6">
+    <h2 class="font-bold mb-2">📢 Старые объявления offerbyvin (2018)</h2>
+    {"".join([f'<div class="border rounded-xl p-3 mb-2"><div class="text-xs font-bold">{o.get("date")}</div><div class="text-xs">{o.get("descr")[:300]}</div></div>' for o in offers]) or "Нет"}
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6">
+    <h2 class="font-bold mb-2">📏 Пробеги</h2>
+    <div class="space-y-2">{probeg_html or "Нет данных"}</div>
   </div>
 
   <div class="bg-white rounded-[24px] p-6 mb-6">
@@ -303,9 +286,12 @@ def generate_html_v39(target, data):
     <div class="max-h-80 overflow-y-auto border rounded-xl p-2 bg-gray-50">{logs_html}</div>
   </div>
 
-  <div class="bg-white rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold mb-2">📏 Пробеги</h2>
-    <div class="space-y-2">{probeg_html or "Нет данных"}</div>
+  <div class="bg-blue-50 border border-blue-200 rounded-[20px] p-4">
+    <div class="text-xs"><b>Что делать дальше:</b><br>
+    1. Если autophoto для Р671ЕТ152 вернул 0 — это нормально, значит машину не фоткали на platesmania.com<br>
+    2. Тогда используем autophoto + nomerogram вместе: свежие фото с авто.ру все равно пока 500, ждем фикс apipoint<br>
+    3. Для Отчета №2 (ржавая 11.07 → чистая 12.09) — грузим фото вручную через бота
+    </div>
   </div>
 </div></body></html>"""
     return html
@@ -318,25 +304,50 @@ bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
 def main_kb():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📄 Проверить v39 BYPASS source_url")],[KeyboardButton(text="🔄 Сброс")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📄 Проверить v41 AUTOPHOTO")],
+        [KeyboardButton(text="📸 Загрузить фото для ИИ анализа")],
+        [KeyboardButton(text="🔄 Сброс")]
+    ], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    await m.answer(f"Бот v39 BYPASS ✅\n\napipoint carPhoto 500 — обхожу через оригинальные url из nomerogram.rez[].url (auto.ru / drom / avito) и парсю фото напрямую без токена.\n\nПришли VIN", reply_markup=main_kb())
+    await m.answer(f"Бот v41 AUTOPHOTO ✅\n\nТеперь использую autophoto (platesmania.com) вместо carPhoto 500.\nДает прямые ссылки без токена, цена 1.60₽\n\nПришли VIN или госномер", reply_markup=main_kb())
 
 @dp.message()
 async def handle(m: types.Message):
-    text = (m.text or "").upper().replace(" ", "")
-    mm = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text)
-    if mm:
-        vin = mm.group(0)
-        await m.answer(f"🔍 {vin} — беру фото с оригинальных страниц объявлений (обход carPhoto 500)...")
-        data = await check_v39(vin)
-        html = generate_html_v39(vin, data)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v39_SOURCE_URL_BYPASS.html")
-        await m.answer_document(file, caption=f"📄 v39: {len(data.get('b64_images',[]))} фото с оригинальных страниц (обход 500)", reply_markup=main_kb())
+    text_raw = (m.text or "").strip()
+    text = text_raw.upper().replace(" ", "")
+
+    # Госномер?
+    mm_gos = re.search(r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}', text_raw.upper())
+    # VIN?
+    mm_vin = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text)
+
+    if mm_vin:
+        vin = mm_vin.group(0)
+        reg = "Р671ЕТ152"  # для теста этого авто
+        if mm_gos:
+            reg = mm_gos.group(0)
+        await m.answer(f"🔍 VIN {vin} + гос {reg} — беру autophoto с platesmania.com (обход carPhoto 500)...")
+        data = await check_v41(vin, reg)
+        html = generate_html_v41(vin, data)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v41_AUTOPHOTO.html")
+        await m.answer_document(file, caption=f"📄 v41: autophoto {reg} — найдено {len(data.get('autophoto',{}).get('records',[]))} фото, скачано {len(data.get('b64_images',[]))} с platesmania.com", reply_markup=main_kb())
         return
-    await m.answer("Пришли VIN", reply_markup=main_kb())
+
+    if mm_gos:
+        reg = mm_gos.group(0)
+        # VIN неизвестен, берем тот же для теста
+        vin = "W0L0AHL3582033491"
+        await m.answer(f"🔍 Гос {reg} — беру autophoto с platesmania.com...")
+        data = await check_v41(vin, reg)
+        html = generate_html_v41(vin, data)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{reg}_v41_AUTOPHOTO.html")
+        await m.answer_document(file, caption=f"📄 v41: autophoto {reg} — {len(data.get('b64_images',[]))} фото", reply_markup=main_kb())
+        return
+
+    await m.answer("Пришли VIN или госномер (например Р671ЕТ152)", reply_markup=main_kb())
 
 async def main():
     await dp.start_polling(bot)
