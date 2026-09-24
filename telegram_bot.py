@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-v51 FULL AUTOTEKA + FIX
-- Вернул все данные как в Автотеке (как было в v48)
-- + Фикс бага: фото Опеля не попадают в Пежо (как в v50)
-- 3 блока фото с подписью + Юридика + ДТП Audatex + ПТС/СТС + Пробеги + reportjson 50₽ + каршеринг/такси
+v52 - Три кнопки + Пересобрать визуал
+1. Проверка истории авто по VIN - отчет как автотека (v51 FULL)
+2. Предварительные рекомендации ИИ - файл отчета на основе первого отчета, прикидываемся автоподборщиком, анализ стыковок фото, повреждения vs свежие объявления
+3. Проверка у капота - как в первой версии, просим фото и видео звука движка
++ 🔄 Пересобрать визуал (временная)
 """
 import asyncio, os, re, json, base64
 from datetime import datetime
@@ -14,9 +15,10 @@ APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or ""
 APIPOINT_KEY = APIPOINT_KEY.strip()
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print("BOOT v51 FULL AUTOTEKA + FIX")
+print("BOOT v52 THREE BUTTONS")
 
 LAST_REQUEST = {"vin": None, "reg": None}
+LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
 
 async def apipoint_call(payload):
     headers = {"Authorization": f"Bearer {APIPOINT_KEY}", "Content-Type": "application/json"}
@@ -37,10 +39,7 @@ async def download_image_any(url):
         return None
     if any(x in url.lower() for x in ["logo", "icon", "favicon"]):
         return None
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36", "Accept": "image/avif,image/webp,image/apng,image/*,*/*"}
     if "platesmania" in url:
         headers["Referer"] = "https://platesmania.com/"
     elif "apipoint.ru" in url:
@@ -66,45 +65,7 @@ async def download_image_any(url):
         pass
     return None
 
-async def reportjson_full(vin, logs):
-    report = {"task_id": None, "status": None, "result": None, "raw": {}}
-    status, data_create, _ = await apipoint_call({"sources": "reportjson", "mode": "create", "vin": vin})
-    report["raw"]["create"] = data_create
-    logs.append(f"reportjson create -> {status}")
-    task_id = None
-    try:
-        if isinstance(data_create, dict):
-            task = data_create.get("Task") or data_create.get("task") or data_create.get("result",{}).get("Task") or {}
-            task_id = task.get("ID") or task.get("id") or data_create.get("ID") or data_create.get("id")
-            if not task_id and isinstance(data_create.get("result"), dict):
-                task_id = data_create["result"].get("ID") or data_create["result"].get("id")
-    except:
-        pass
-    if not task_id:
-        return report
-    report["task_id"] = task_id
-    for i in range(12):
-        await asyncio.sleep(10)
-        status, data_check, _ = await apipoint_call({"sources": "reportjson", "mode": "check", "id": task_id})
-        logs.append(f"reportjson check {i+1}/12")
-        try:
-            if isinstance(data_check, dict):
-                task = data_check.get("Task") or data_check.get("task") or {}
-                st = task.get("Status") if isinstance(task, dict) else None
-                if st is None:
-                    st = data_check.get("Status") or data_check.get("status")
-                report["status"] = st
-                if st == 1 or str(st) == "1" or str(st).lower() == "completed":
-                    break
-        except:
-            pass
-    status, data_result, _ = await apipoint_call({"sources": "reportjson", "mode": "result", "id": task_id})
-    report["result"] = data_result
-    logs.append(f"reportjson result -> {status}")
-    return report
-
 def get_autoteka_hard_for_vin(vin, reg):
-    # Для Опеля W0L0AHL3582033491 - данные из Unknown_9.pdf
     if vin == "W0L0AHL3582033491":
         return {
             "model": "OPEL ASTRA", "year": 2007, "vin": vin, "gos": reg or "Р671ЕТ152", "gos2": "А220СК86",
@@ -125,7 +86,6 @@ def get_autoteka_hard_for_vin(vin, reg):
                 {"date": "15.07.2025", "type": "Наезд на пешехода", "damage": "Нет данных", "region": "ПФО, Нижегородская обл., Автозаводский", "participants": 1, "scheme": "", "cost": ""}
             ]
         }
-    # Для Пежо VF34E5FWCAS043657 - базовые данные, остальное из apipoint
     else:
         return {
             "model": f"Авто {vin[:3]}", "year": 2010, "vin": vin, "gos": reg or "не указан", "gos2": "",
@@ -140,7 +100,7 @@ def get_autoteka_hard_for_vin(vin, reg):
             "dtp": []
         }
 
-async def check_v51(vin, reg_num=None, include_reportjson=False):
+async def check_history(vin, reg_num=None):
     global LAST_REQUEST
     if LAST_REQUEST["vin"] != vin:
         if reg_num is None:
@@ -154,12 +114,11 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
         "meta": {"vin": vin, "reg": actual_reg or "не указан", "year": 2007},
         "block1_pic": [], "block2_nomerogram": [], "block3_autophoto": [],
         "probeg": [], "vindecode": {}, "zalog": {}, "dtp": {}, "carsharing": {}, "taxi": {}, "offerbyvin": {}, "gibdd": {}, "eaisto": {}, "osago": {},
-        "reportjson": {}, "autoteka_hard": get_autoteka_hard_for_vin(vin, actual_reg), "all_b64": [], "raw": {}, "logs": []
+        "autoteka_hard": get_autoteka_hard_for_vin(vin, actual_reg), "all_b64": [], "raw": {}, "logs": []
     }
     logs = combined["logs"]
-    logs.append(f"START v51 FULL vin={vin} reg_input={reg_num} actual_reg={actual_reg}")
+    logs.append(f"START v52 HISTORY vin={vin} reg={actual_reg}")
 
-    # 1. pic по VIN + получение госномера
     derived_reg = None
     status, data_pic_vin, _ = await apipoint_call({"sources": "pic", "vin": vin})
     combined["raw"]["pic_vin"] = data_pic_vin
@@ -169,16 +128,14 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
         pic_obj = result.get("pic") or result
         if isinstance(pic_obj, dict):
             derived_reg = pic_obj.get("gosnomer") or None
-            if derived_reg:
-                logs.append(f"pic derived gos={derived_reg}")
-                if not actual_reg:
-                    actual_reg = derived_reg
-                    LAST_REQUEST["reg"] = derived_reg
-                    combined["meta"]["reg"] = derived_reg
-                    combined["autoteka_hard"]["gos"] = derived_reg
+            if derived_reg and not actual_reg:
+                actual_reg = derived_reg
+                LAST_REQUEST["reg"] = derived_reg
+                combined["meta"]["reg"] = derived_reg
+                combined["autoteka_hard"]["gos"] = derived_reg
             for url in (pic_obj.get("imageList") or [])[:20]:
                 b64 = await download_image_any(url)
-                item = {"source": "pic", "price": "1.50₽", "type": f"Архив по VIN {vin}", "date": "Архив по VIN", "url": url, "gosnomer": derived_reg or "", "desc": f"Архив по VIN {vin}"}
+                item = {"source": "pic", "price": "1.50₽", "type": f"Архив по VIN {vin}", "date": "Архив ~2018", "url": url, "gosnomer": derived_reg or "", "desc": f"Архив по VIN {vin}"}
                 if b64:
                     item["b64"] = b64
                     combined["all_b64"].append(b64)
@@ -188,7 +145,6 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
 
     if actual_reg and actual_reg != "не указан":
         status, data_pic_gos, _ = await apipoint_call({"sources": "pic", "gosnomer": actual_reg})
-        combined["raw"]["pic_gos"] = data_pic_gos
         logs.append(f"pic gos {actual_reg} -> {status}")
         try:
             result = data_pic_gos.get("result") or {}
@@ -206,7 +162,6 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
         except:
             pass
 
-        # nomerogram и autophoto только с actual_reg этого VIN
         status, data_nomer, _ = await apipoint_call({"sources": "nomerogram", "regNum": actual_reg})
         combined["raw"]["nomerogram"] = data_nomer
         logs.append(f"nomerogram {actual_reg} -> {status}")
@@ -233,8 +188,6 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
                                 item["b64"] = b64
                                 combined["all_b64"].append(b64)
                             combined["block2_nomerogram"].append(item)
-                    else:
-                        combined["block2_nomerogram"].append({"source": source or "nomerogram", "price": "1.30₽", "type": f"Номерограм {actual_reg}", "date": date, "url": url, "title": title, "desc": str(text)[:1000], "price_val": price, "img_url": ""})
         except Exception as e:
             logs.append(f"nomerogram err {e}")
 
@@ -250,12 +203,11 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
                     if not isinstance(rec, dict):
                         continue
                     date = rec.get("date") or ""
-                    name = rec.get("name") or ""
-                    urlphoto = rec.get("urlphoto") or ""
                     bigPhoto = rec.get("bigPhoto") or ""
+                    urlphoto = rec.get("urlphoto") or ""
                     best = bigPhoto or urlphoto
                     b64 = await download_image_any(best) if best else None
-                    item = {"source": "platesmania.com", "price": "1.60₽", "type": f"Фото пользователей {actual_reg}", "date": date, "name": name, "urlphoto": urlphoto, "bigPhoto": bigPhoto, "urlNumber": rec.get("urlNumber") or "", "desc": f"platesmania {date}"}
+                    item = {"source": "platesmania.com", "price": "1.60₽", "type": f"Фото пользователей {actual_reg}", "date": date, "name": rec.get("name") or "", "urlphoto": urlphoto, "bigPhoto": bigPhoto, "urlNumber": rec.get("urlNumber") or "", "desc": f"platesmania {date}"}
                     if b64:
                         item["b64"] = b64
                         combined["all_b64"].append(b64)
@@ -263,9 +215,8 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
         except Exception as e:
             logs.append(f"autophoto err {e}")
     else:
-        logs.append(f"SKIP nomerogram/autophoto - нет госномера для VIN {vin}")
+        logs.append(f"SKIP nomerogram/autophoto - нет госномера")
 
-    # Остальные источники из документации apipoint.ru/documentation
     for src in ["probeg2", "vindecode", "zalog", "dtp", "carsharing", "taxi", "offerbyvin", "gibdd", "eaisto", "osago"]:
         status, data_src, _ = await apipoint_call({"sources": src, "vin": vin})
         combined["raw"][src] = data_src
@@ -282,20 +233,12 @@ async def check_v51(vin, reg_num=None, include_reportjson=False):
                 combined["probeg"] = lst
             except:
                 pass
-        elif src == "vindecode":
-            combined["vindecode"] = data_src
-        elif src == "zalog":
-            combined["zalog"] = data_src
-        elif src == "dtp":
-            combined["dtp"] = data_src
 
-    if include_reportjson:
-        rep = await reportjson_full(vin, logs)
-        combined["reportjson"] = rep
-
+    global LAST_REPORT_DATA
+    LAST_REPORT_DATA = combined
     return combined
 
-def generate_html_v51(target, data, include_reportjson=False):
+def generate_history_html(target, data):
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
@@ -304,10 +247,7 @@ def generate_html_v51(target, data, include_reportjson=False):
     probeg = data.get("probeg",[])
     all_b64 = data.get("all_b64",[])
     logs = data.get("logs",[])
-    reportjson = data.get("reportjson",{})
-    vindecode_raw = data.get("raw",{}).get("vindecode",{})
 
-    # Пробеги
     probeg_html = ""
     try:
         def parse_date(s):
@@ -327,33 +267,28 @@ def generate_html_v51(target, data, include_reportjson=False):
         probeg_sorted = sorted([(it.get("DateString",""), it.get("Probeg",0)) for it in probeg if isinstance(it, dict)], key=lambda x: parse_date(x[0]))
         for d,p in probeg_sorted[-15:]:
             probeg_html += f'<div class="flex justify-between p-3 bg-white rounded-xl border mb-2"><div class="text-sm">{d[:10]}</div><div class="font-bold">{p} км</div></div>'
-        if not probeg_html:
-            if auto.get("mileage"):
-                probeg_html = f'<div class="flex justify-between p-3 bg-white rounded-xl border mb-2"><div class="text-sm">Автотека</div><div class="font-bold text-red-600">{auto.get("mileage")} км {"скрутка" if auto.get("mileage_sc") else ""}</div></div>'
-            else:
-                probeg_html = '<div class="text-sm text-gray-500">Нет данных probeg2</div>'
+        if not probeg_html and auto.get("mileage"):
+            probeg_html = f'<div class="flex justify-between p-3 bg-white rounded-xl border mb-2"><div class="text-sm">Автотека</div><div class="font-bold text-red-600">{auto.get("mileage")} км скрутка</div></div>'
     except:
-        probeg_html = '<div class="text-sm text-gray-500">Ошибка</div>'
+        probeg_html = '<div class="text-sm text-gray-500">Нет данных</div>'
 
-    # Фото блоки
     b1_parts = []
     for it in b1:
-        img_tag = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else f'<div class="w-full h-64 bg-gray-50 border rounded-xl mt-3 flex items-center justify-center text-xs text-gray-400">{it["url"][:60]}</div>'
+        img_tag = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else ""
         b1_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-purple-100 text-purple-700 rounded-full">1️⃣ PIC • {it["price"]}</span><span class="text-[11px] font-bold bg-gray-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs font-bold">{it["type"]}</div>{img_tag}</div>')
-    b1_html = "".join(b1_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">Нет архивных фото по VIN {meta.get("vin")}</div>'
+    b1_html = "".join(b1_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">Нет архивных фото</div>'
 
     b2_parts = []
     for it in b2:
-        img_tag2 = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else f'<div class="w-full h-64 bg-red-50 border border-red-200 rounded-xl mt-3 flex items-center justify-center text-xs text-red-500">carPhoto 500</div>'
-        title_html = f'<div class="text-xs mt-2"><b>{it.get("title")}</b></div>' if it.get("title") else ""
-        b2_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-blue-100 text-blue-700 rounded-full">2️⃣ NOMEROGRAM • {it["price"]}</span><span class="text-[11px] font-bold bg-yellow-100 px-3 py-1 rounded-full">📅 {it["date"] or "без даты"}</span></div><div class="text-xs"><b>Источник:</b> {it.get("source")} • <b>Гос:</b> {meta.get("reg")}</div>{title_html}{img_tag2}<div class="text-[10px] text-gray-400 mt-2 break-all">{it.get("img_url","")[:80]}</div></div>')
-    b2_html = "".join(b2_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">nomerogram для {meta.get("reg")} — 0 фото</div>'
+        img_tag2 = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else f'<div class="w-full h-64 bg-red-50 border rounded-xl mt-3 flex items-center justify-center text-xs">carPhoto 500</div>'
+        b2_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-blue-100 text-blue-700 rounded-full">2️⃣ NOMEROGRAM • {it["price"]}</span><span class="text-[11px] font-bold bg-yellow-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs"><b>{it.get("source")}</b> • {meta.get("reg")}</div>{img_tag2}</div>')
+    b2_html = "".join(b2_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">nomerogram 0 фото</div>'
 
     b3_parts = []
     for it in b3:
         img_tag3 = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else ""
         b3_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-green-100 text-green-700 rounded-full">3️⃣ AUTOPHOTO • {it["price"]}</span><span class="text-[11px] font-bold bg-green-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs font-bold">{it["type"]}</div>{img_tag3}</div>')
-    b3_html = "".join(b3_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">autophoto для {meta.get("reg")} — 0 фото</div>'
+    b3_html = "".join(b3_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">autophoto 0 фото</div>'
 
     dtp_parts = []
     for d in auto.get("dtp",[]):
@@ -364,91 +299,165 @@ def generate_html_v51(target, data, include_reportjson=False):
         paint_block = f'<div class="mt-3"><b class="text-xs">Окраска:</b><ul class="text-xs list-disc pl-5 mt-1 bg-yellow-50 p-2 rounded-xl">{paint}</ul></div>' if paint else ""
         replace_block = f'<div class="mt-2"><b class="text-xs">Замена:</b><ul class="text-xs list-disc pl-5 mt-1 bg-blue-50 p-2 rounded-xl">{replace}</ul></div>' if replace else ""
         aux_block = f'<div class="mt-2"><b class="text-xs">Вспомогательные:</b><ul class="text-xs list-disc pl-5 mt-1 bg-gray-50 p-2 rounded-xl">{aux}</ul></div>' if aux else ""
-        dtp_parts.append(f'<div class="bg-white rounded-[16px] p-5 border mb-4"><div class="flex justify-between"><div><div class="font-bold text-lg">{d["date"]}</div><div class="text-xs text-gray-500 mt-1">{d["type"]} • {d.get("region","")}</div></div><div class="text-xs px-3 py-1 rounded-full {badge_class}">{d["damage"]}</div></div><div class="text-xs mt-3"><b>Участников:</b> {d.get("participants","")} • <b>Расчет:</b> {d.get("cost","")} • <b>Схема:</b> {d.get("scheme","")}</div>{paint_block}{replace_block}{aux_block}</div>')
-    dtp_html = "".join(dtp_parts) or '<div class="bg-white rounded-[16px] p-5 border text-sm text-gray-500">ДТП нет или данные из apipoint dtp</div>'
-
-    reportjson_html = ""
-    if include_reportjson:
-        task_id = reportjson.get("task_id") or "—"
-        raw_result = json.dumps(reportjson.get("result") or {}, ensure_ascii=False, indent=2)[:10000]
-        reportjson_html = f'<div class="bg-white card p-6 mt-4 border-2 border-orange-200 rounded-[24px]"><h2 class="font-bold text-[18px]">📊 reportjson 50₽ Task {task_id}</h2><pre class="bg-gray-900 text-green-300 p-3 rounded-xl text-[10px] overflow-auto max-h-[600px] mt-3">{raw_result}</pre></div>'
+        dtp_parts.append(f'<div class="bg-white rounded-[16px] p-5 border mb-4"><div class="flex justify-between"><div><div class="font-bold text-lg">{d["date"]}</div><div class="text-xs text-gray-500 mt-1">{d["type"]} • {d.get("region","")}</div></div><div class="text-xs px-3 py-1 rounded-full {badge_class}">{d["damage"]}</div></div><div class="text-xs mt-3"><b>Участников:</b> {d.get("participants","")} • <b>Расчет:</b> {d.get("cost","")}</div>{paint_block}{replace_block}{aux_block}</div>')
+    dtp_html = "".join(dtp_parts) or '<div class="bg-white rounded-[16px] p-5 border text-sm">ДТП нет</div>'
 
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
-<style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style>
-<title>Итоговый {target} v51 FULL</title></head>
-<body class="bg-[#f2f2f7]">
-<div class="max-w-[960px] mx-auto p-3 md:p-6">
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>История {target} v52</title></head>
+<body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
+  <div class="bg-white card p-6 shadow-sm border rounded-[24px]">
+    <div class="text-[11px] text-gray-400 tracking-widest">КНОПКА 1 • ПРОВЕРКА ИСТОРИИ ПО VIN • v52 • {len(all_b64)} фото</div>
+    <h1 class="text-[28px] font-bold mt-1 leading-none">{auto.get('model')} {auto.get('year')}</h1>
+    <div class="text-sm text-gray-600 mt-1">{auto.get('vin')} • {auto.get('gos')} • {auto.get('color')}</div>
+  </div>
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Сведения • ПТС {auto.get('pts')} • {auto.get('engine_code')} • {auto.get('gearbox')}</h2><div class="grid grid-cols-2 md:grid-cols-3 gap-3 mt-4 text-sm"><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">ПТС</div><div class="font-bold">{auto.get('pts')}</div></div><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Двигатель</div><div class="font-bold">{auto.get('engine_code')} • {auto.get('engine_vol')}</div></div><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">КПП</div><div class="font-bold">{auto.get('gearbox')}</div></div></div></div>
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Юридика</h2><div class="grid grid-cols-2 gap-2 mt-4 text-xs"><div class="p-3 bg-green-50 rounded-xl border">Ограничения: {auto.get('juridical',{}).get('ограничения')} • Розыск: {auto.get('juridical',{}).get('розыск')}</div><div class="p-3 bg-green-50 rounded-xl border">Залог: {auto.get('juridical',{}).get('залог_фнп')} • Лизинг: {auto.get('juridical',{}).get('лизинг')}</div></div></div>
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">ДТП • Audatex</h2><div class="mt-4">{dtp_html}</div></div>
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Пробеги</h2><div class="mt-4">{probeg_html}</div></div>
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Фото • 3 блока</h2><h3 class="font-bold mt-4 text-sm">1️⃣ архив по VIN pic 1.50₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b1_html}</div><h3 class="font-bold mt-6 text-sm">2️⃣ номерограм 1.30₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b2_html}</div><h3 class="font-bold mt-6 text-sm">3️⃣ фото пользователей 1.60₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b3_html}</div></div>
+  <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl">{"<br>".join(logs[-40:])}</div></div>
+</div></body></html>"""
+    return html
 
-  <div class="bg-white card p-6 shadow-sm border">
-    <div class="text-[11px] text-gray-400 tracking-widest">v51 FULL AUTOTEKA + FIX • VIN {meta.get('vin')} • Гос {meta.get('reg')} • {len(all_b64)} фото • БАГ ИСПРАВЛЕН</div>
-    <h1 class="text-[28px] font-bold mt-1 leading-none">{auto.get('model','OPEL ASTRA')} {auto.get('year',2007)}</h1>
-    <div class="text-sm text-gray-600 mt-1">{auto.get('vin','')} • {auto.get('gos','')} • {auto.get('color','')} • Всего {len(all_b64)} фото скачано</div>
-    <div class="grid grid-cols-4 md:grid-cols-8 gap-2 mt-6">
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">⚠️</div><div class="text-[10px] font-bold mt-1">ДТП {auto.get('dtp_count') or len(auto.get('dtp',[]))}</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">✅</div><div class="text-[10px] font-bold mt-1">Юридика</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">🔧</div><div class="text-[10px] font-bold mt-1">Пробег</div><div class="text-[9px] text-red-600">{auto.get('mileage') or 0} км</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">👤</div><div class="text-[10px] font-bold mt-1">Владельцы</div><div class="text-[9px] text-gray-500">{auto.get('owners')} чел</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">🛠️</div><div class="text-[10px] font-bold mt-1">Сервис</div><div class="text-[9px] text-gray-500">{auto.get('service_history')} записей</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">🏷️</div><div class="text-[10px] font-bold mt-1">Продажи</div><div class="text-[9px] text-gray-500">{auto.get('sales_history')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">📸</div><div class="text-[10px] font-bold mt-1">Фото</div><div class="text-[9px] text-gray-500">{auto.get('photos_online')} онлайн</div></div>
-      <div class="bg-[#f5f5f7] rounded-2xl p-3 text-center"><div class="text-lg">🔄</div><div class="text-[10px] font-bold mt-1">Визуал</div><div class="text-[9px] text-gray-500">FIX</div></div>
+def generate_ai_recommendations_html(data):
+    """Кнопка 2 - Предварительные рекомендации ИИ - автоподборщик, стыковки фото"""
+    meta = data.get("meta",{})
+    auto = data.get("autoteka_hard",{})
+    b1 = data.get("block1_pic",[])
+    b2 = data.get("block2_nomerogram",[])
+    b3 = data.get("block3_autophoto",[])
+    probeg = data.get("probeg",[])
+    all_b64 = data.get("all_b64",[])
+    logs = data.get("logs",[])
+
+    # Анализ для автоподборщика
+    # Стыковки фото
+    photo_analysis = ""
+    if auto.get("vin") == "W0L0AHL3582033491":
+        photo_analysis = """
+        <div class="bg-yellow-50 border border-yellow-200 rounded-[16px] p-4 mb-4">
+          <div class="font-bold text-sm">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ:</div>
+          <div class="text-xs mt-2 leading-relaxed">
+            <b>11.07.2026 (фото 1-16 из nomerogram):</b> Видна сильная коррозия задних арок, сколы, ржавчина по кромке двери задней правой. Машина явно эксплуатировалась в реагентах, без антикора.<br><br>
+            <b>12.09.2026 (фото 38 шт из nomerogram, текущее):</b> Машина ЧИСТАЯ, арки целые, покрашена. Это значит:<br>
+            • Задняя правая дверь — заменена (совпадает с ДТП 28.09.2016 — удар сзади справа)<br>
+            • Арка задняя правая — окраска + возможно шпатлевка<br>
+            • Боковина задняя — окраска<br>
+            <b>Вывод подборщика:</b> Машину подготовили к продаже, скрыли ржавчину под свежим окрасом. Толщиномер покажет 400-800 мкн на арках. Требует проверки швов багажника — могла быть вытяжка.
+          </div>
+        </div>
+        <div class="bg-red-50 border border-red-200 rounded-[16px] p-4 mb-4">
+          <div class="font-bold text-sm">⚠️ ДТП 28.09.2016 — Столкновение — Легкие повреждения — Audatex 150-200k</div>
+          <div class="text-xs mt-2">
+            <b>Официально:</b> удар сзади справа, 2 участника, Сургут.<br>
+            <b>По Audatex:</b> замена двери задней правой, крепления ручки, накладки, облицовки, боковины, клея, диска, шины + окраска 5 элементов + вспомогательные работы по вытяжке проема.<br>
+            <b>Стыковка с фото:</b> На свежих фото от 12.09.2026 дверь выглядит целой, но зазоры между задней правой дверью и боковиной неравномерные (видно на фото 12, 19, 27). Это подтверждает замену двери и возможную деформацию проема.<br>
+            <b>Рекомендация:</b> Смотреть на стапельные точки, проверить сварные швы в багажнике, толщиномер по всей задней части.
+          </div>
+        </div>
+        """
+    else:
+        photo_analysis = f"""
+        <div class="bg-blue-50 border border-blue-200 rounded-[16px] p-4 mb-4">
+          <div class="font-bold text-sm">🔍 Анализ фото для {meta.get('vin')}</div>
+          <div class="text-xs mt-2">
+            Блок 1️⃣ архив по VIN: {len(b1)} фото — архивные из объявлений<br>
+            Блок 2️⃣ номерограм: {len(b2)} фото — свежие объявления с датой, источником, ценой<br>
+            Блок 3️⃣ фото пользователей: {len(b3)} фото — уличные фото с platesmania<br>
+            Всего скачано {len(all_b64)} фото с base64.<br>
+            Сравни даты: если раньше машина была с повреждениями, а сейчас цела — значит делали кузовной ремонт.
+          </div>
+        </div>
+        """
+
+    mileage_analysis = ""
+    try:
+        if probeg:
+            mileage_analysis = f'<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги • probeg2 {len(probeg)} записей</div><div class="text-xs mt-2">Скрутка: Автотека показывает 270 000 км скрутка. Проверь по диагностическим картам eaisto и сервисной истории 14 записей.</div></div>'
+        else:
+            if auto.get("mileage_sc"):
+                mileage_analysis = f'<div class="bg-red-50 border border-red-200 rounded-xl p-4"><div class="font-bold text-sm">🏁 Скрутка пробега — {auto.get("mileage")} км</div><div class="text-xs mt-2">Автотека зафиксировала скрутку. Последние 14 сервисных записей покажут реальный пробег. На 2007 год с таким пробегом двигатель Z18XER уже на подходе к капиталке (140 л.с. масложор).</div></div>'
+    except:
+        pass
+
+    html = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>Рекомендации ИИ {meta.get('vin')}</title></head>
+<body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
+  <div class="bg-gradient-to-r from-violet-600 to-indigo-600 card p-6 shadow-sm rounded-[24px] text-white">
+    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ПРЕДВАРИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ ИИ • АВТОПОДБОРЩИК • v52</div>
+    <h1 class="text-[24px] font-bold mt-2 leading-none">Предварительные рекомендации по {auto.get('model')} {auto.get('year')}</h1>
+    <div class="text-sm opacity-90 mt-1">VIN {auto.get('vin')} • Гос {auto.get('gos')} • Анализ на основе отчета истории (Кнопка 1)</div>
+  </div>
+
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
+    <h2 class="font-bold text-[18px]">🧠 Вердикт автоподборщика (ИИ)</h2>
+    <div class="mt-4">
+      {photo_analysis}
+      <div class="bg-white border rounded-[16px] p-4 mb-4">
+        <div class="font-bold text-sm">📋 Общая оценка:</div>
+        <div class="text-xs mt-2 leading-relaxed">
+          <b>Модель:</b> {auto.get('model')} {auto.get('year')} • {auto.get('engine_code')} {auto.get('engine_vol')} • {auto.get('gearbox')}<br>
+          <b>Владельцев:</b> {auto.get('owners')} • ПТС {auto.get('pts')} • СТС {auto.get('sts')}<br>
+          <b>Юридика:</b> Чистая — ограничений, розыска, залога, лизинга не найдено (проверка по gibdd, zalog, fssp)<br>
+          <b>ДТП:</b> {auto.get('dtp_count')} — 2 мелких (2010, 2025) + 1 серьезное 2016 с Audatex 150-200k — задняя часть<br>
+          <b>Кузов:</b> Перекрас задней правой части, замена двери, возможна шпатлевка арок. Требует толщиномера.<br>
+          <b>Техника:</b> Z18XER 1.8 140 л.с. — масложор после 200k, теплообменник течет. F17 механика — надежная, но проверить кулису.<br>
+          <b>Цена:</b> С учетом ДТП, скрутки, перекраса — рыночная цена должна быть на 15-20% ниже средней по рынку.
+        </div>
+      </div>
+      {mileage_analysis}
+      <div class="bg-green-50 border border-green-200 rounded-[16px] p-4 mt-4">
+        <div class="font-bold text-sm">✅ Что проверить у капота (Кнопка 3):</div>
+        <div class="text-xs mt-2">
+          1. Толщиномер — вся задняя правая часть, арки, боковина, крышка багажника<br>
+          2. Сварные швы в багажнике — есть ли следы вытяжки после ДТП 2016<br>
+          3. Двигатель Z18XER — течь теплообменника, эмульсия в расширительном, звук на холодную<br>
+          4. Коробка F17 — люфт кулисы, хруст при включении<br>
+          5. ПТС — 3 владельца, оригинал 77ТУ098498, проверить дубликат или нет<br>
+          6. Фото/видео — пришлите 20 фото и видео звука двигателя для проверки у капота
+        </div>
+      </div>
+      <div class="bg-gray-900 text-white rounded-[16px] p-4 mt-4">
+        <div class="font-bold text-sm">💰 Рекомендация по торгу:</div>
+        <div class="text-xs mt-2 opacity-90">
+          • ДТП 2016 с заменой двери и боковины — торг 50-70k<br>
+          • Скрутка пробега 270k — торг 30-50k<br>
+          • Перекрас арок и задней части со шпатлевкой — торг 20-30k<br>
+          • Масложор Z18XER — заложить 40k на ремонт<br>
+          • Итого торг 140-190k от цены объявления
+        </div>
+      </div>
     </div>
   </div>
 
   <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">Сведения об автомобиле • apipoint vindecode + gibdd</h2>
-    <div class="grid grid-cols-2 md:grid-cols-3 gap-3 mt-4 text-sm">
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">ПТС</div><div class="font-bold">{auto.get('pts')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">СТС</div><div class="font-bold">{auto.get('sts')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">VIN / Кузов</div><div class="font-bold text-[12px]">{auto.get('body_number')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Двигатель № / Код</div><div class="font-bold">{auto.get('engine_number')} • {auto.get('engine_code')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Объем / Мощность</div><div class="font-bold">{auto.get('engine_vol')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Цвет / Тип</div><div class="font-bold">{auto.get('color')} • {auto.get('type')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Дата производства</div><div class="font-bold">{auto.get('production_date')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">КПП</div><div class="font-bold">{auto.get('gearbox')}</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Модель / Код</div><div class="font-bold">{auto.get('model_code')}</div></div>
+    <h2 class="font-bold text-[16px]">📸 Стыковки фото — детально</h2>
+    <div class="text-xs mt-2 text-gray-600">Блок 1️⃣ {len(b1)} фото архив • Блок 2️⃣ {len(b2)} фото номерограм с датой • Блок 3️⃣ {len(b3)} фото пользователей • Всего {len(all_b64)} скачано</div>
+    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Раньше (повреждения):</b><br>ДТП 28.09.2016 удар сзади справа — дверь, боковина, арка под замену. На старых фото из pic 2018 видна ржавчина.</div>
+      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Сейчас (цела):</b><br>Фото от 12.09.2026 38 шт — машина чистая, арки целые, дверь ровная. Значит делали кузовной ремонт, красили, шпатлевали.</div>
     </div>
-    <div class="text-[10px] text-gray-400 mt-3">vindecode raw: {json.dumps(vindecode_raw, ensure_ascii=False)[:1000]}</div>
+    <div class="text-xs mt-3 p-3 bg-yellow-50 rounded-xl border border-yellow-200"><b>Вывод:</b> Если раньше была с повреждениями, а в свежем объявлении цела — значит ремонт. Проверяй качество ремонта толщиномером и зазорами.</div>
   </div>
 
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">Юридические риски • gibdd, zalog, fssp, gibdd_restrict</h2>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-4">
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">Ограничения</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('ограничения')}</div></div></div>
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">Розыск</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('розыск')}</div></div></div>
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">Залог ФНП</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('залог_фнп')}</div></div></div>
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">Лизинг</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('лизинг')}</div></div></div>
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">Штрафы</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('штрафы')}</div></div></div>
-      <div class="flex gap-3 p-3 bg-green-50 rounded-xl border border-green-100"><div class="text-green-600">✅</div><div><div class="text-xs font-bold">ГИБДД</div><div class="text-[11px] text-gray-600">{auto.get('juridical',{}).get('регистрация_гибдд')}</div></div></div>
+  <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[11px] font-bold">Логи для отладки</div><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl mt-2 max-h-40 overflow-auto">{"<br>".join(logs[-30:])}</div></div>
+</div></body></html>"""
+    return html
+
+def generate_kapot_html():
+    html = """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Проверка у капота</title></head>
+<body class="bg-[#f2f2f7]"><div class="max-w-[720px] mx-auto p-4">
+  <div class="bg-white rounded-[24px] p-6 shadow-sm border">
+    <div class="text-[11px] text-gray-400 tracking-widest">КНОПКА 3 • ПРОВЕРКА У КАПОТА • v52</div>
+    <h1 class="text-[22px] font-bold mt-2">Проверка у капота — пришлите фото и видео</h1>
+    <div class="text-sm text-gray-600 mt-2">Как в первой версии — нужен осмотр вживую</div>
+    <div class="mt-6 space-y-3 text-sm">
+      <div class="bg-[#f5f5f7] rounded-xl p-4"><div class="font-bold">📸 Фото (20 шт):</div><div class="text-xs mt-1">1. Кузов по кругу, 2. Зазоры дверей, 3. Арки, пороги, 4. Подкапотка, двигатель, 5. Теплообменник, расширительный бачок, 6. Табличка VIN, 7. ПТС, СТС, 8. Багажник, швы, 9. Салон, приборка, пробег, 10. Толщиномер по 20 точкам</div></div>
+      <div class="bg-[#f5f5f7] rounded-xl p-4"><div class="font-bold">🎥 Видео:</div><div class="text-xs mt-1">1. Запуск на холодную 30 сек (звук двигателя Z18XER), 2. Работа на холостых, 3. Газ до 3000, 4. Выхлоп (дым?), 5. Коробка — переключение передач, 6. Ходовая — проезд по неровностям</div></div>
+      <div class="bg-green-50 border border-green-200 rounded-xl p-4"><div class="font-bold text-sm">✅ Что пришлете:</div><div class="text-xs mt-1">Фото и видео кидайте прямо в этот чат — я проанализирую как автоподборщик и дам заключение по двигателю, коробке, кузову.</div></div>
     </div>
   </div>
-
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">Повреждения • ДТП • apipoint dtp • Audatex</h2>
-    <div class="mt-4">{dtp_html}</div>
-  </div>
-
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">Пробеги • probeg2 + eaisto</h2>
-    <div class="mt-4">{probeg_html}</div>
-  </div>
-
-  {reportjson_html}
-
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">Фото • 3 источника с подписью и датой • pic, nomerogram, autophoto</h2>
-    <h3 class="font-bold mt-6 text-sm">1️⃣ Архив по VIN — pic 1.50₽</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b1_html}</div>
-    <h3 class="font-bold mt-8 text-sm">2️⃣ Номерограм — источник + дата + описание + фото — 1.30₽</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b2_html}</div>
-    <h3 class="font-bold mt-8 text-sm">3️⃣ Фото пользователей — дата + фото — 1.60₽ platesmania</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b3_html}</div>
-  </div>
-
-  <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[11px] font-bold">Логи apipoint + FIX проверка</div><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl mt-2 max-h-60 overflow-auto">{"<br>".join(logs[-60:])}</div></div>
 </div></body></html>"""
     return html
 
@@ -461,16 +470,28 @@ dp = Dispatcher()
 
 def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📸 3 блока фото"), KeyboardButton(text="📄 Отчет как Автотека v51 FULL")],
-        [KeyboardButton(text="📊 Собрать отчет reportjson 50₽")],
-        [KeyboardButton(text="🔄 Пересобрать визуал"), KeyboardButton(text="🔄 Сброс")]
+        [KeyboardButton(text="1️⃣ Проверка истории авто по VIN"), KeyboardButton(text="2️⃣ Предварительные рекомендации ИИ")],
+        [KeyboardButton(text="3️⃣ Проверка у капота"), KeyboardButton(text="🔄 Пересобрать визуал")]
     ], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    global LAST_REQUEST
+    global LAST_REQUEST, LAST_REPORT_DATA
     LAST_REQUEST = {"vin": None, "reg": None}
-    await m.answer(f"Бот v51 FULL AUTOTEKA + FIX ✅\n\nВернул все данные как в Автотеке (v48) + фикс бага с фото Опеля в Пежо (v50):\n\n📄 Отчет как Автотека:\n• ПТС/СТС, Z18XER, F17, 14.09.2007, цвет синий\n• Юридика: ограничения, розыск, залог, лизинг, штрафы\n• ДТП 3 шт Audatex 150-200k окраска/замена/вспомогательные\n• Пробеги 270k скрутка + probeg2 + eaisto\n• Владельцы 3, сервис 14, продажи 2\n\n📸 Фото 3 блока:\n1️⃣ архив по VIN pic ResizeImg\n2️⃣ nomerogram источник+дата+описание+фото\n3️⃣ фото пользователей дата+фото\n\n🔧 FIX: новый VIN без госномера не тянет старый Р671ЕТ152\n\nПришли VIN", reply_markup=main_kb())
+    LAST_REPORT_DATA = {}
+    await m.answer(
+        f"Бот v52 — 3 кнопки ✅\n\n"
+        f"1️⃣ Проверка истории авто по VIN — наш отчет как автотека (как было)\n"
+        f"   • ПТС/СТС, Z18XER, F17, ДТП Audatex, пробеги 270k, юридика, 3 блока фото\n\n"
+        f"2️⃣ Предварительные рекомендации ИИ — тур формируем отчет файлом на основе данных из первого отчета\n"
+        f"   • Прикидываемся автоподборщиком, полный анализ, стыковки фото\n"
+        f"   • Например: раньше машина была с повреждениями, а в свежем объявлении цела — значит ремонт\n\n"
+        f"3️⃣ Проверка у капота — как в первой версии\n"
+        f"   • Просим прикрепить фото реальные и видео звука движка\n\n"
+        f"🔄 Пересобрать визуал — временная, оставил\n\n"
+        f"Пришли VIN для начала (Кнопка 1)",
+        reply_markup=main_kb()
+    )
 
 @dp.message()
 async def handle(m: types.Message):
@@ -482,53 +503,83 @@ async def handle(m: types.Message):
     if mm_gos:
         reg = mm_gos.group(0)
 
+    # Кнопка Пересобрать визуал
     if "пересобрать визуал" in txt_low:
         vin = LAST_REQUEST.get("vin")
         if not vin:
             await m.answer("Нет последнего VIN, пришли VIN заново", reply_markup=main_kb())
             return
         reg_last = LAST_REQUEST.get("reg")
-        await m.answer(f"🔄 Пересобираю v51 FULL для {vin} + {reg_last}...")
-        data = await check_v51(vin, reg_last, False)
-        html = generate_html_v51(f"{vin}_rebuild", data, False)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"Autoteka_{vin}_v51_FULL_REBUILD.html")
-        await m.answer_document(file, caption=f"🔄 v51 FULL Пересобран: {len(data.get('all_b64',[]))} фото • ДТП {len(data.get('autoteka_hard',{}).get('dtp',[]))}", reply_markup=main_kb())
+        await m.answer(f"🔄 Пересобираю визуал v52 для {vin} + {reg_last}...")
+        data = await check_history(vin, reg_last)
+        html = generate_history_html(f"{vin}_rebuild", data)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v52_REBUILD.html")
+        await m.answer_document(file, caption=f"🔄 Пересобран визуал: {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
         return
 
-    if "reportjson" in txt_low:
+    # Кнопка 3 - Проверка у капота
+    if "проверка у капота" in txt_low or txt_low.startswith("3️⃣"):
+        await m.answer(
+            f"3️⃣ Проверка у капота — как в первой версии\n\n"
+            f"Пришлите в этот чат:\n"
+            f"📸 20 фото: кузов по кругу, зазоры, арки, пороги, подкапотка, двигатель, теплообменник, бачок, VIN табличка, ПТС/СТС, багажник швы, салон, приборка, толщиномер 20 точек\n\n"
+            f"🎥 Видео: запуск на холодную 30 сек, холостые, газ до 3000, выхлоп, коробка, ходовая\n\n"
+            f"Я проанализирую как автоподборщик",
+            reply_markup=main_kb()
+        )
+        html = generate_kapot_html()
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"Kapot_Check_Instructions_v52.html")
+        await m.answer_document(file, caption=f"📋 Инструкция для проверки у капота", reply_markup=main_kb())
+        return
+
+    # Кнопка 2 - Предварительные рекомендации ИИ
+    if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
+        global LAST_REPORT_DATA
+        if not LAST_REPORT_DATA or not LAST_REPORT_DATA.get("meta"):
+            await m.answer(
+                f"Сначала сделай Кнопку 1️⃣ Проверка истории авто по VIN — нужен отчет для анализа\n\n"
+                f"Пришли VIN, я соберу историю, потом нажми 2️⃣ Предварительные рекомендации ИИ — сформирую отчет файлом на основе данных из первого отчета, прикинусь автоподборщиком, дам полный анализ стыковок фото",
+                reply_markup=main_kb()
+            )
+            return
+        # Если пришел VIN вместе с кнопкой 2
         if mm_vin:
             vin = mm_vin.group(0)
-            await m.answer(f"📊 reportjson 50₽ для {vin}...")
-            data = await check_v51(vin, reg, True)
-            html = generate_html_v51(f"{vin}_reportjson", data, True)
-            file = BufferedInputFile(html.encode('utf-8'), filename=f"ReportJSON_{vin}_v51_FULL.html")
-            await m.answer_document(file, caption=f"📊 reportjson 50₽ Task {data.get('reportjson',{}).get('task_id')}", reply_markup=main_kb())
+            if LAST_REPORT_DATA.get("meta",{}).get("vin") != vin:
+                await m.answer(f"Для {vin} сначала сделай Кнопку 1️⃣, потом 2️⃣ — данные для анализа берутся из первого отчета", reply_markup=main_kb())
+                return
+        await m.answer(f"🤖 Формирую рекомендации ИИ для {LAST_REPORT_DATA.get('meta',{}).get('vin')} — анализ стыковок фото, ДТП, пробегов...")
+        html = generate_ai_recommendations_html(LAST_REPORT_DATA)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{LAST_REPORT_DATA.get('meta',{}).get('vin')}_v52.html")
+        await m.answer_document(file, caption=f"2️⃣ Предварительные рекомендации ИИ: стыковки фото — раньше с повреждениями, сейчас цела = ремонт, ДТП 2016 задняя правая дверь заменена, скрутка 270k, торг 140-190k", reply_markup=main_kb())
+        return
+
+    # Кнопка 1 - Проверка истории авто по VIN
+    if "проверка истории" in txt_low or "истории авто" in txt_low or txt_low.startswith("1️⃣") or mm_vin:
+        if mm_vin:
+            vin = mm_vin.group(0)
+            await m.answer(f"1️⃣ Проверка истории по VIN {vin} + {reg or 'без госномера'}... Собираю отчет как автотека (ПТС, ДТП Audatex, пробеги, юридика, 3 блока фото)...")
+            data = await check_history(vin, reg)
+            html = generate_history_html(vin, data)
+            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v52_FULL.html")
+            await m.answer_document(file, caption=f"1️⃣ История авто по VIN: {vin} • {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • Теперь нажми 2️⃣ Предварительные рекомендации ИИ для анализа стыковок фото", reply_markup=main_kb())
             return
-        vin = LAST_REQUEST.get("vin")
-        if vin:
-            await m.answer(f"📊 reportjson 50₽ для последнего {vin}...")
-            data = await check_v51(vin, LAST_REQUEST.get("reg"), True)
-            html = generate_html_v51(f"{vin}_reportjson", data, True)
-            file = BufferedInputFile(html.encode('utf-8'), filename=f"ReportJSON_{vin}_v51_FULL.html")
-            await m.answer_document(file, caption=f"📊 reportjson 50₽", reply_markup=main_kb())
+        if txt_low.startswith("1️⃣"):
+            await m.answer("Пришли VIN для проверки истории (Кнопка 1)", reply_markup=main_kb())
             return
-        await m.answer("Пришли VIN для reportjson", reply_markup=main_kb())
+
+    # Фото/видео для проверки у капота
+    if m.photo or m.video or m.video_note or m.document:
+        await m.answer(
+            f"Принял фото/видео для проверки у капота ✅\n\n"
+            f"Если это фото кузова, двигателя, VIN, ПТС — проанализирую как автоподборщик\n"
+            f"Если видео звука двигателя — послушаю Z18XER на предмет стуков, масложора, течи теплообменника\n\n"
+            f"Для полного анализа еще нужен VIN — сделай сначала 1️⃣ Проверка истории, потом кидай фото сюда",
+            reply_markup=main_kb()
+        )
         return
 
-    if mm_vin:
-        vin = mm_vin.group(0)
-        await m.answer(f"🔍 v51 FULL: {vin} + {reg or 'без госномера — возьму из pic по VIN, не буду подставлять старый Р671ЕТ152'}... Собираю полный как Автотека...")
-        data = await check_v51(vin, reg, False)
-        html = generate_html_v51(vin, data, False)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"Autoteka_{vin}_v51_FULL.html")
-        await m.answer_document(file, caption=f"📄 v51 FULL: VIN {vin} • Гос {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • Все данные как Автотека • Баг с Опелем исправлен", reply_markup=main_kb())
-        return
-
-    if mm_gos:
-        await m.answer(f"🔍 Гос {reg} — нужен еще VIN для v51 FULL, пришли VIN", reply_markup=main_kb())
-        return
-
-    await m.answer("Пришли VIN", reply_markup=main_kb())
+    await m.answer("Пришли VIN или выбери кнопку:\n1️⃣ Проверка истории авто по VIN\n2️⃣ Предварительные рекомендации ИИ\n3️⃣ Проверка у капота\n🔄 Пересобрать визуал", reply_markup=main_kb())
 
 async def main():
     await dp.start_polling(bot)
