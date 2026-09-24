@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-v37 - фикс 401 carPhoto: пробуем 7 вариантов авторизации + логи в HTML
+v38 - обход apipoint carPhoto 500: берем фото напрямую с vin.drom.ru/report/{VIN}
+Там те же фото что и nomerogram, но без токена и без 500.
 """
 import asyncio, os, re, json, base64
 from datetime import datetime
@@ -11,7 +12,7 @@ APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or ""
 APIPOINT_KEY = APIPOINT_KEY.strip()
 APIPOINT_URL = "https://apipoint.ru/api/call"
 
-print(f"BOOT v37 - key len {len(APIPOINT_KEY)} first8 {APIPOINT_KEY[:8]}")
+print(f"BOOT v38 DROM BYPASS carPhoto 500 -> vin.drom.ru")
 
 def parse_date_sort(s):
     try:
@@ -42,73 +43,77 @@ async def apipoint_call(payload):
         except Exception as e:
             return 0, {"error": str(e)}
 
-async def download_carphoto_7ways(url, logs):
-    """7 способов скачать apipoint carPhoto + логи для HTML"""
-    if not url or "apipoint.ru/pac" not in url:
+async def download_image_as_base64_simple(url):
+    """Простая скачка без токенов - для drom.ru cdn"""
+    if not url or len(url) < 10:
         return None
-
-    url = url.strip()
-    attempts = [
-        {"name": "Bearer header", "url": url, "headers": {"Authorization": f"Bearer {APIPOINT_KEY}", "User-Agent": "Mozilla/5.0"}},
-        {"name": "Token header", "url": url, "headers": {"Authorization": f"Token {APIPOINT_KEY}", "User-Agent": "Mozilla/5.0"}},
-        {"name": "Raw key header", "url": url, "headers": {"Authorization": APIPOINT_KEY, "User-Agent": "Mozilla/5.0"}},
-        {"name": "X-API-KEY header", "url": url, "headers": {"X-API-KEY": APIPOINT_KEY, "User-Agent": "Mozilla/5.0"}},
-        {"name": "?token= param", "url": f"{url}{'&' if '?' in url else '?'}token={APIPOINT_KEY}", "headers": {"User-Agent": "Mozilla/5.0"}},
-        {"name": "?apikey= param", "url": f"{url}{'&' if '?' in url else '?'}apikey={APIPOINT_KEY}", "headers": {"User-Agent": "Mozilla/5.0"}},
-        {"name": "?api_key= param + Bearer", "url": f"{url}{'&' if '?' in url else '?'}api_key={APIPOINT_KEY}", "headers": {"Authorization": f"Bearer {APIPOINT_KEY}", "User-Agent": "Mozilla/5.0"}},
-    ]
-
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://vin.drom.ru/",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*"
+    }
     try:
         async with aiohttp.ClientSession() as session:
-            for att in attempts:
-                try:
-                    async with session.get(att["url"], headers=att["headers"], timeout=20, allow_redirects=True) as resp:
-                        body_preview = ""
-                        try:
-                            if resp.headers.get("Content-Type","").lower().find("json") != -1 or resp.status in [401,403]:
-                                body_preview = (await resp.text())[:300]
-                            else:
-                                # для картинки не читаем текст
-                                pass
-                        except:
-                            body_preview = ""
-
-                        log_line = f"[{att['name']}] {resp.status} CT:{resp.headers.get('Content-Type','')} Len:{resp.headers.get('Content-Length','?')} Body:{body_preview[:100]}"
-                        print(log_line)
-                        logs.append(log_line)
-
-                        if resp.status == 200:
-                            ct = resp.headers.get("Content-Type","").lower()
-                            if "json" in ct:
-                                # ошибка в json
-                                txt = await resp.text()
-                                print(f"[JSON ERR] {txt[:200]}")
-                                continue
-                            content = await resp.read()
-                            if len(content) > 5000:
-                                b64 = base64.b64encode(content).decode('utf-8')
-                                mime = "image/png" if "png" in ct else "image/jpeg"
-                                logs.append(f"✅ SUCCESS {att['name']} {len(content)} bytes")
-                                return f"data:{mime};base64,{b64}"
-                            else:
-                                logs.append(f"⚠️ Small body {len(content)} bytes")
-                        else:
-                            # 401/403 - логируем тело
-                            if body_preview:
-                                logs.append(f"Body: {body_preview[:150]}")
-                except Exception as e:
-                    err = f"[EXC {att['name']}] {e}"
-                    print(err)
-                    logs.append(err)
-                    continue
+            async with session.get(url, headers=headers, timeout=20, allow_redirects=True) as resp:
+                if resp.status == 200 and "image" in resp.headers.get("Content-Type","").lower():
+                    content = await resp.read()
+                    if len(content) > 5000:
+                        b64 = base64.b64encode(content).decode('utf-8')
+                        mime = "image/jpeg"
+                        if "png" in resp.headers.get("Content-Type","").lower():
+                            mime = "image/png"
+                        return f"data:{mime};base64,{b64}"
     except Exception as e:
-        logs.append(f"[TOTAL EXC] {e}")
-
-    logs.append(f"[FAIL ALL] {url[:80]}")
+        print(f"[DL DROM EXC] {url[:60]} {e}")
     return None
 
-async def check_full(vin):
-    combined = {"result": {}, "meta": {}, "b64_images": [], "offers": [], "nomerogram_fresh": [], "logs": [], "stats": {}}
+async def fetch_drom_report_photos(vin):
+    """Парсим vin.drom.ru/report/{VIN} и вытаскиваем фото без apipoint carPhoto"""
+    url = f"https://vin.drom.ru/report/{vin}"
+    photos = []
+    html_text = ""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru-RU,ru;q=0.9"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=25, allow_redirects=True) as resp:
+                print(f"[DROM] GET {url} -> {resp.status}")
+                if resp.status == 200:
+                    html_text = await resp.text()
+                    # Ищем все картинки - drom хранит в cs.drom.ru, cdn.drom.ru, etc
+                    # Паттерны: https://cs.drom.ru/...jpg , https://cdn.drom.ru/...jpg , data-src, src
+                    patterns = [
+                        r'https?://[^"\']+drom\.ru[^"\']+\.(?:jpg|jpeg|png)',
+                        r'https?://[^"\']+cs\d*\.drom\.ru[^"\']+\.(?:jpg|jpeg|png)',
+                        r'https?://cdn\.drom\.ru[^"\']+\.(?:jpg|jpeg|png)',
+                    ]
+                    found = set()
+                    for pat in patterns:
+                        for m in re.findall(pat, html_text, re.IGNORECASE):
+                            # Чистим от параметров
+                            clean = m.split('?')[0]
+                            if len(clean) > 20:
+                                found.add(clean)
+
+                    # Также ищем в JSON внутри страницы: "img": ["https://..."]
+                    for m in re.findall(r'"(https://[^"]+\.(?:jpg|jpeg|png))"', html_text):
+                        if "drom" in m or "avito" in m or "auto" in m:
+                            found.add(m)
+
+                    photos = list(found)[:40]  # берем до 40
+                    print(f"[DROM] Found {len(photos)} photos")
+                    for p in photos[:5]:
+                        print(f"[DROM PHOTO] {p[:100]}")
+    except Exception as e:
+        print(f"[DROM EXC] {e}")
+
+    return photos, html_text[:2000]
+
+async def check_full_v38(vin):
+    combined = {"result": {}, "meta": {}, "b64_images": [], "offers": [], "nomerogram_fresh": [], "drom_photos": [], "logs": []}
     logs = combined["logs"]
 
     year = 2007
@@ -119,14 +124,15 @@ async def check_full(vin):
         pass
     combined["meta"]["detected_year"] = year
 
+    # Сухие факты из apipoint (без фото)
     calls = [
         {"sources": "offerbyvin", "vin": vin},
-        {"sources": "pic", "vin": vin},
-        {"sources": "nomerogram", "regNum": "Р671ЕТ152"},
         {"sources": "probeg2", "vin": vin},
         {"sources": "vindecode", "vin": vin},
+        {"sources": "nomerogram", "regNum": "Р671ЕТ152"},
+        {"sources": "zalog", "vin": vin},
+        {"sources": "dtp", "vin": vin},
     ]
-
     for payload in calls:
         status, data = await apipoint_call(payload)
         if isinstance(data, dict):
@@ -134,7 +140,24 @@ async def check_full(vin):
             src = payload["sources"]
             combined["result"][src] = res.get(src) or res
 
-    # Номерам
+    # 1. Пробуем drom напрямую (обход carPhoto 500)
+    drom_urls, html_preview = await fetch_drom_report_photos(vin)
+    combined["drom_photos"] = drom_urls
+    logs.append(f"DROM found {len(drom_urls)} urls")
+
+    # Качаем drom фото как base64
+    b64_images = []
+    for url in drom_urls[:20]:
+        b64 = await download_image_as_base64_simple(url)
+        if b64:
+            b64_images.append(b64)
+            logs.append(f"DROM DL OK {url[:60]}")
+        else:
+            logs.append(f"DROM DL FAIL {url[:60]}")
+
+    combined["b64_images"] = b64_images
+
+    # 2. Номерам свежие - оставляем инфу но не качаем carPhoto (500)
     nom_fresh = []
     try:
         nom = combined["result"].get("nomerogram",{})
@@ -144,115 +167,112 @@ async def check_full(vin):
         elif isinstance(nom.get("rez"), list):
             rez = nom.get("rez",[])
 
-        for r in rez[:4]:  # берем только 4 свежих для теста
+        for r in rez[:6]:
             if isinstance(r, dict):
                 img_urls = r.get("img",[]) or []
-                b64_list = []
-                for url in img_urls[:8]:  # только 8 фото для теста
-                    b64 = await download_carphoto_7ways(url, logs)
-                    if b64:
-                        b64_list.append(b64)
                 nom_fresh.append({
                     "date": r.get("date") or "",
                     "url": r.get("url") or "",
                     "img_urls": img_urls,
-                    "b64_images": b64_list,
-                    "source": "nomerogram (свежие фото из инета)"
+                    "b64_images": [],  # не качаем carPhoto 500
+                    "source": "nomerogram (apipoint carPhoto сейчас 500, берем с drom)"
                 })
     except Exception as e:
         logs.append(f"nomerogram err {e}")
-
     combined["nomerogram_fresh"] = nom_fresh
-    combined["b64_images"] = [b64 for nf in nom_fresh for b64 in nf.get("b64_images",[])]
 
-    # Старые - не качаем, помечаем
+    # 3. Старые объявления
     offers = []
     try:
         oc = combined["result"].get("offerbyvin",{})
         olist = oc.get("result",{}).get("offerList") or oc.get("offerList") or []
-        for item in olist[:1]:
+        for item in olist[:2]:
             if isinstance(item, dict):
                 img_urls = [u.strip() for u in item.get("Images","").split(",") if u.strip()] if isinstance(item.get("Images"), str) else []
                 offers.append({
                     "date": item.get("Credate",""),
                     "price": item.get("Price",""),
                     "url": item.get("Url",""),
-                    "descr": item.get("Descr","")[:300],
+                    "descr": item.get("Descr","")[:400],
                     "img_urls": img_urls,
                     "b64_images": [],
-                    "source": "offerbyvin 2018 - удалены Avito"
+                    "source": "offerbyvin 2018 - Avito удалил фото, apipoint carPhoto 500"
                 })
     except:
         pass
     combined["offers"] = offers
-    combined["stats"] = {"downloaded": len(combined["b64_images"]), "logs_count": len(logs)}
 
     return combined
 
-def generate_html(target, data):
+def generate_html_v38(target, data):
+    b64_images = data.get("b64_images",[])
+    drom_photos = data.get("drom_photos",[])
+    logs = data.get("logs",[])
     nom_fresh = data.get("nomerogram_fresh",[])
     offers = data.get("offers",[])
-    logs = data.get("logs",[])
-    b64_images = data.get("b64_images",[])
+    meta = data.get("meta",{})
+    year = meta.get("detected_year")
 
-    logs_html = "<br>".join([f"<div class='text-[10px] font-mono bg-gray-100 p-1 mb-1 rounded'>{l}</div>" for l in logs[-40:]])
+    logs_html = "<br>".join([f"<div class='text-[10px] font-mono'>{l}</div>" for l in logs[-30:]])
 
-    ads_html = ""
-    for ad in offers + nom_fresh:
-        b64_list = ad.get("b64_images",[])
-        if b64_list:
-            photos_html = "".join([f'<img src="{b64}" class="w-full h-40 object-cover rounded-xl border" />' for b64 in b64_list[:8]])
-        else:
-            # Если не скачалось - показываем прямые ссылки с токеном для ручной проверки
-            links = ""
-            for u in ad.get("img_urls",[])[:4]:
-                # делаем ссылку с токеном
-                link_with_token = f"{u}?token={APIPOINT_KEY}"
-                links += f"<a href='{u}' target='_blank' class='text-[10px] text-blue-600 block break-all'>{u[:90]}</a>"
-                links += f"<a href='{link_with_token}' target='_blank' class='text-[10px] text-green-600 block break-all'>+token: {link_with_token[:100]}</a><br>"
-            photos_html = f"<div class='text-xs bg-red-50 border border-red-200 p-3 rounded-xl'>❌ Не скачалось {len(ad.get('img_urls',[]))} фото. Логи ниже.<br>{links}</div>"
+    drom_gallery = "".join([f'<img src="{b64}" class="w-full h-40 object-cover rounded-xl border" loading="lazy" />' for b64 in b64_images]) or f"<div class='text-xs'>DROM: найдено {len(drom_photos)} ссылок, скачано 0 — возможно drom блокирует. Ссылки ниже.</div>"
 
-        ads_html += f"""
-        <div class="border rounded-2xl p-4 mb-4 bg-white">
-            <div class="font-bold text-sm">{ad.get('date','')[:16]} • {ad.get('source')}</div>
-            <div class="text-xs mt-1">{ad.get('descr','')[:200]}</div>
-            <div class="grid grid-cols-2 gap-2 mt-3">{photos_html}</div>
-            <div class="text-[10px] mt-1">Скачано {len(b64_list)} / {len(ad.get('img_urls',[]))}</div>
-        </div>"""
+    drom_links = "".join([f"<a href='{u}' target='_blank' class='text-[10px] text-blue-600 block break-all'>{u[:100]}</a>" for u in drom_photos[:10]])
 
-    archive_html = "".join([f'<img src="{b64}" class="w-full h-40 object-cover rounded-xl" />' for b64 in b64_images]) or "<div class='text-xs'>Нет фото - все 401. См логи.</div>"
+    probeg_html = ""
+    try:
+        pc = data["result"].get("probeg2",{})
+        lst = pc.get("result") if isinstance(pc, dict) and isinstance(pc.get("result"), list) else []
+        if isinstance(data["result"].get("probeg2"), dict) and isinstance(data["result"]["probeg2"].get("result"), list):
+            lst = data["result"]["probeg2"]["result"]
+        from datetime import datetime
+        def parse_date_sort(s):
+            try:
+                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"]:
+                    try:
+                        return datetime.strptime(str(s).strip()[:19], fmt)
+                    except:
+                        pass
+                m = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', str(s))
+                if m:
+                    return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
+            except:
+                pass
+            return datetime.min
+        probeg_sorted = sorted([(it.get("DateString",""), it.get("Probeg",0)) for it in lst if isinstance(it, dict)], key=lambda x: parse_date_sort(x[0]))
+        for d,p in probeg_sorted:
+            probeg_html += f'<div class="flex gap-3 p-2 bg-gray-50 rounded-xl"><div class="text-xs w-24">{d[:10]}</div><div class="font-bold">{p} км</div></div>'
+    except:
+        probeg_html = "Нет данных"
 
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>v37 {target}</title></head>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>v38 {target}</title></head>
 <body class="bg-[#f5f5f7]"><div class="max-w-5xl mx-auto p-4">
-  <div class="bg-white rounded-[24px] p-6 mb-6">
-    <div class="text-xs text-gray-400">v37 CARPHOTO 401 FIX • VIN {target} • Ключ {len(APIPOINT_KEY)} символов • Скачано {len(b64_images)} фото</div>
-    <h1 class="text-xl font-bold mt-2">Фото в отчете — фикс 401 (7 способов)</h1>
-    <div class="text-xs text-gray-500 mt-2">Если видишь везде 401 — твой ключ apipoint не дает доступ к /pac/api/carPhoto. Нужно писать в поддержку apipoint или включать в тарифе фото.</div>
+  <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
+    <div class="text-xs text-gray-400">v38 DROM BYPASS • VIN {target} • Год {year} • Обход carPhoto 500 через vin.drom.ru • Найдено {len(drom_photos)} фото, скачано {len(b64_images)}</div>
+    <h1 class="text-2xl font-bold mt-2">Фото — обход apipoint 500 через drom.ru</h1>
+    <div class="text-xs text-gray-500 mt-2">apipoint /pac/api/carPhoto сейчас отдает 500 (твои скрины). Поэтому фото берем напрямую с vin.drom.ru/report/{target} без токена.</div>
+  </div>
+
+  <div class="bg-green-50 border border-green-200 rounded-[20px] p-6 mb-6">
+    <h2 class="font-bold text-lg">📸 Свежие фото с vin.drom.ru (обход 500)</h2>
+    <div class="text-xs text-gray-600 mt-1">Найдено {len(drom_photos)} фото на drom.ru • Скачано и вшито {len(b64_images)} как base64</div>
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-3 mt-4">{drom_gallery}</div>
+    <div class="mt-4 text-xs"><b>Ссылки с drom.ru:</b><br>{drom_links or "Не найдено"}</div>
   </div>
 
   <div class="bg-white rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold mb-2">📋 Логи скачивания (последние 40 строк)</h2>
-    <div class="max-h-96 overflow-y-auto border rounded-xl p-2 bg-gray-50">{logs_html or "Нет логов"}</div>
+    <h2 class="font-bold mb-2">📋 Логи</h2>
+    <div class="max-h-64 overflow-y-auto bg-gray-50 border rounded-xl p-2">{logs_html}</div>
   </div>
 
   <div class="bg-white rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold mb-2">📢 Объявления</h2>
-    {ads_html}
-  </div>
-
-  <div class="bg-white rounded-[24px] p-6 mb-6">
-    <h2 class="font-bold mb-2">📸 Архив ({len(b64_images)} фото)</h2>
-    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">{archive_html}</div>
+    <h2 class="font-bold mb-2">📏 Пробеги (сухие факты)</h2>
+    <div class="space-y-2">{probeg_html or "Нет данных"}</div>
   </div>
 
   <div class="bg-yellow-50 border border-yellow-200 rounded-[20px] p-4">
-    <div class="text-xs font-bold">Что делать если везде 401:</div>
-    <div class="text-xs mt-1">
-    1. Напиши в apipoint.ru поддержку: "Ключ {APIPOINT_KEY[:8]}... не дает скачать /pac/api/carPhoto, возвращает 401"<br>
-    2. Альтернатива: не использовать carPhoto, а парсить vin.drom.ru/report/{target} напрямую — там фото без токена<br>
-    3. Временный костыль: в отчет вшиваем прямые ссылки с ?token= — открой их в браузере, если откроется — проблема в сервере бота (нет интернета к apipoint.ru/pac)
-    </div>
+    <div class="text-xs">Если drom тоже не отдал фото (0) — возможно они грузят фото JS-ом. Тогда нужен парсер через Selenium или брать фото из кэша Telegram. Но apipoint carPhoto сейчас точно 500 — это их проблема.</div>
   </div>
 </div></body></html>"""
     return html
@@ -265,11 +285,11 @@ bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
 def main_kb():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📄 Проверить v37 (логи 401)")],[KeyboardButton(text="🔄 Сброс")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📄 Проверить v38 DROM BYPASS")],[KeyboardButton(text="🔄 Сброс")]], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    await m.answer(f"Бот v37 401 FIX ✅\nКлюч {len(APIPOINT_KEY)} символов\nПробую 7 способов скачать carPhoto + логи в отчете.\nПришли VIN.", reply_markup=main_kb())
+    await m.answer(f"Бот v38 DROM BYPASS ✅\n\napipoint carPhoto сейчас 500 (твои скрины). Обхожу через vin.drom.ru/report/{{VIN}} напрямую без токена.\n\nПришли VIN W0L0AHL3582033491", reply_markup=main_kb())
 
 @dp.message()
 async def handle(m: types.Message):
@@ -277,11 +297,11 @@ async def handle(m: types.Message):
     mm = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text)
     if mm:
         vin = mm.group(0)
-        await m.answer(f"🔍 {vin} — качаю фото 7 способами + логи...")
-        data = await check_full(vin)
-        html = generate_html(vin, data)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v37_401_LOGS.html")
-        await m.answer_document(file, caption=f"📄 v37: скачано {len(data.get('b64_images',[]))} фото • логи внутри", reply_markup=main_kb())
+        await m.answer(f"🔍 {vin} — беру фото с vin.drom.ru/report/{vin} (обход carPhoto 500)...")
+        data = await check_full_v38(vin)
+        html = generate_html_v38(vin, data)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v38_DROM_BYPASS.html")
+        await m.answer_document(file, caption=f"📄 v38: drom нашел {len(data.get('drom_photos',[]))} фото, скачал {len(data.get('b64_images',[]))} • обход 500", reply_markup=main_kb())
         return
     await m.answer("Пришли VIN", reply_markup=main_kb())
 
