@@ -20,7 +20,7 @@ OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v53 WELCOME+OPENROUTER model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+print(f"BOOT v55 WELCOME+OPENROUTER+PRO_PROMPT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -39,7 +39,7 @@ async def apipoint_call(payload):
         except Exception as e:
             return 0, {"error": str(e)}, str(e)
 
-async def call_openrouter_ai(prompt_text, system_text="Ты — опытный автоподборщик с 15 лет стажа."):
+async def call_openrouter_ai(prompt_text, system_text="Ты — злой, честный автоподборщик из Москвы с 15 лет опыта. Ты ненавидишь перекупов. Твоя задача — спасти клиента от покупки хлама. Ты говоришь прямо, жестко, без воды, как другу в гараже. Если видишь косяк — говори прямо. Если данных нет — пиши 'нет данных', не выдумывай. Никаких фраз 'нужно проверить' — давай конкретику из цифр которые тебе дали."):
     """Реальный запрос в OpenRouter"""
     if not OPENROUTER_API_KEY:
         return None, "Нет ключа OPENROUTER_API_KEY"
@@ -55,8 +55,8 @@ async def call_openrouter_ai(prompt_text, system_text="Ты — опытный �
             {"role": "system", "content": system_text},
             {"role": "user", "content": prompt_text}
         ],
-        "temperature": 0.3,
-        "max_tokens": 4000
+        "temperature": 0.4,
+        "max_tokens": 6000
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -540,7 +540,7 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
     return html
 
 def build_prompt_for_openrouter(data):
-    """Собирает промпт для OpenRouter из данных отчета истории"""
+    """Собирает ЖЕСТКИЙ промпт для OpenRouter — без воды, только факты"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     probeg = data.get("probeg",[])
@@ -551,60 +551,100 @@ def build_prompt_for_openrouter(data):
     b2 = len(data.get("block2_nomerogram",[]))
     b3 = len(data.get("block3_autophoto",[]))
 
-    vindecode_info = ""
-    try:
-        vd_raw = raw.get("vindecode",{}).get("result",{})
-        vindecode_info = json.dumps(vd_raw, ensure_ascii=False)[:2000]
-    except:
-        vindecode_info = "нет данных"
+    def safe_json(key, limit=3500):
+        try:
+            r = raw.get(key,{}).get("result",{})
+            s = json.dumps(r, ensure_ascii=False, indent=2)
+            return s[:limit]
+        except:
+            return "нет данных"
 
-    probeg_info = ""
-    try:
-        probeg_info = json.dumps(probeg[:10], ensure_ascii=False)[:2000] if probeg else "нет записей probeg2"
-    except:
-        probeg_info = str(probeg)[:2000]
+    vindecode = safe_json("vindecode")
+    probeg_raw = safe_json("probeg2")
+    dtp_raw = safe_json("dtp")
+    zalog_raw = safe_json("zalog", 1500)
+    gibdd_raw = safe_json("gibdd", 1500)
+    eaisto_raw = safe_json("eaisto", 1000)
 
-    dtp_info = ""
+    # Пробеги человекочитаемо
+    probeg_lines = []
     try:
-        dtp_raw = raw.get("dtp",{}).get("result",{})
-        dtp_info = json.dumps(dtp_raw, ensure_ascii=False)[:2000]
+        for p in probeg[-12:]:
+            if isinstance(p, dict):
+                probeg_lines.append(f"{p.get('DateString','?')} — {p.get('Probeg','?')} км — {p.get('Source','?')}")
     except:
-        dtp_info = "нет данных dtp"
+        pass
+    probeg_human = "\n".join(probeg_lines) or "нет записей"
 
-    zalog_info = ""
-    try:
-        zalog_raw = raw.get("zalog",{}).get("result",{})
-        zalog_info = json.dumps(zalog_raw, ensure_ascii=False)[:1000]
-    except:
-        zalog_info = "нет данных"
-
-    prompt = f"""Ты — опытный автоподборщик. Тебе дали отчет по VIN.
+    prompt = f"""ВХОДНЫЕ ДАННЫЕ ДЛЯ РАЗБОРА:
 
 VIN: {vin}
 Гос: {reg}
-Модель (из базы): {auto.get('model')} {auto.get('year')} {auto.get('engine_code')} {auto.get('color')}
-Фото: архив по VIN {b1} шт, номерограм {b2} шт, пользователи {b3} шт
+База (если есть): {auto.get('model')} {auto.get('year')} {auto.get('engine_code')} {auto.get('engine_vol')} {auto.get('color')} {auto.get('gearbox')}
+Владельцев: {auto.get('owners')} ПТС: {auto.get('pts')}
+Фото: архив VIN {b1} шт, номерограм {b2} шт, улицы {b3} шт
 
-vindecode: {vindecode_info}
+--- VINDECODE (марка/мотор/год) ---
+{vindecode}
 
-Пробеги probeg2 ({len(probeg)} записей): {probeg_info}
+--- ПРОБЕГИ (важно для скрутки) ---
+{probeg_human}
+RAW probeg2: {probeg_raw}
 
-ДТП dtp: {dtp_info}
+--- ДТП ---
+{dtp_raw}
 
-Залог zalog: {zalog_info}
+--- ЗАЛОГ / ОГРАНИЧЕНИЯ ---
+Залог: {zalog_raw}
+ГИБДД: {gibdd_raw}
 
-Юридика: {auto.get('juridical')}
+--- ТЕХОСМОТР ---
+{eaisto_raw}
 
-Дай короткий вердикт как подборщик:
-1. Стоит ли ехать смотреть? (да/нет/осторожно)
-2. Где точно крашено / шпаклевано по стыковкам фото?
-3. Скрутка есть?
-4. Что проверить толщиномером у капота?
-5. На сколько торговаться и почему?
-6. Риски по юридике.
+--- ЮРИДИКА из базы ---
+{auto.get('juridical')}
 
-Пиши просто, без воды, как для клиента который хочет не купить хлам. Не выдумывай данные Опеля если VIN другой. Говори только про {vin}.
-Формат: списки, эмодзи минимум, конкретика.
+ЗАДАЧА:
+Ты автоподборщик. Разнеси эту тачку. Клиент хочет понять брать или нет.
+
+СТРОГИЕ ПРАВИЛА:
+- Не пиши "нужно проверять по фото" — у тебя уже есть цифры. Если фото 11 архивных и 0 свежих — так и скажи.
+- Не выдумывай другой VIN. Говори ТОЛЬКО про {vin}. Забудь про Опель W0L0AHL3582033491 если VIN другой.
+- Если скрутка — покажи математику: был 53600 в 2013, стал 130120 в 2020 = +76520 за 7 лет = 10к в год — подозрительно мало.
+- Если ДТП нет — пиши "ДТП по базам нет".
+- Если гос не указан — пиши что номерограм/автофото пропущены и это норм.
+
+ВЫДАЙ ОТВЕТ СТРОГО В ТАКОМ ФОРМАТЕ (копируй заголовки):
+
+🚦 ВЕРДИКТ: [ЕХАТЬ / НЕ ЕХАТЬ / ЕХАТЬ ОСТОРОЖНО] — 1-2 предложения почему.
+
+🎨 КУЗОВ:
+- Что по фото: сколько архивных, сколько свежих, что это значит
+- Где крашено: конкретно какие детали (если нет данных — "по базам окрасов нет, смотри толщиномером")
+- Стыковки: если была бита и стала целая — укажи
+
+⏱️ ПРОБЕГ:
+- Есть ли скрутка? Докажи цифрами
+- Средний пробег в год, логика
+- Что с пробегом сейчас
+
+🔧 ТЕХНИКА (для этой модели):
+- Что ломается у этой модели обычно (возьми из vindecode марки)
+- На что смотреть у капота
+
+⚖️ ЮРИДИКА:
+- Залог, ограничения, розыск — есть/нет
+- ПТС, владельцы
+
+💰 ТОРГ:
+- Конкретно за что торговаться и сколько: "ДТП 2016 — 50к, скрутка — 30к, итого 80-120к"
+- Если косяков нет — "Торг 20-30к на резину/ТО"
+
+✅ ЧТО ПРОВЕРИТЬ У КАПОТА (10 точек толщиномером):
+1. ...
+10. ...
+
+Пиши коротко, жестко, как в гараже. Без воды. Эмодзи только в заголовках.
 """
     return prompt
 
@@ -754,7 +794,12 @@ async def handle(m: types.Message):
     await m.answer("Пришли VIN или выбери кнопку:\n1️⃣ Проверка истории авто по VIN\n2️⃣ Предварительные рекомендации ИИ\n3️⃣ Проверка у капота\n🔄 Пересобрать визуал", reply_markup=main_kb())
 
 async def main():
-    await dp.start_polling(bot)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook deleted, polling start")
+    except Exception as e:
+        print(f"delete_webhook error: {e}")
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
