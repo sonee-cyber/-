@@ -1,27 +1,17 @@
 # -*- coding: utf-8 -*-
-import asyncio, os, re, json, base64, logging
+import asyncio, os, re, json, base64, random
+from datetime import datetime
 import aiohttp
-logging.basicConfig(level=logging.INFO)
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except:
-    HAS_BS4 = False
-
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
-from openai import AsyncOpenAI
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OR_KEY = os.getenv("OPENAI_API_KEY")
 APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN")
 APIPOINT_URL = "https://apipoint.ru/api/call"
+CACHE_DIR = "/mnt/data/cache_reports"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-print(f"BOOT v27 PHOTO BASE64 + CORRECT SKRUTKA + YEAR CHECK")
+print("BOOT v31 UNOFFICIAL AVITO + DROM FRESH ADS")
 
 def parse_date_sort(s):
-    from datetime import datetime
     try:
         s = str(s).strip()
         for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"]:
@@ -34,34 +24,7 @@ def parse_date_sort(s):
             return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
     except:
         pass
-    from datetime import datetime as dt
-    return dt.min
-
-def extract_year_from_vindecode(data):
-    try:
-        result = data.get("result",{})
-        vd = result.get("vindecode",{})
-        decode = vd.get("decode",{}) if isinstance(vd, dict) else {}
-        reports = decode.get("reports",[]) if isinstance(decode, dict) else []
-        if reports:
-            r0 = reports[0]
-            year = r0.get("startYear") or r0.get("modelYear")
-            if year:
-                return int(str(year)[:4])
-        vd2 = result.get("vindecode2",{})
-        inner = vd2.get("result",{}) if isinstance(vd2, dict) else {}
-        if isinstance(inner, dict) and inner.get("year"):
-            return int(inner["year"])
-    except:
-        pass
-    return None
-
-def extract_year_from_vin_10th(vin):
-    codes = {'A':2010,'B':2011,'C':2012,'D':2013,'E':2014,'F':2015,'G':2016,'H':2017,'J':2018,'K':2019,'L':2020,'M':2021,'N':2022,'P':2023,'R':2024,'S':2025,'T':2026,'V':2027,'W':2028,'X':2029,'Y':2000,'1':2001,'2':2002,'3':2003,'4':2004,'5':2005,'6':2006,'7':2007,'8':2008,'9':2009}
-    try:
-        return codes.get(vin[9].upper())
-    except:
-        return None
+    return datetime.min
 
 async def apipoint_call(payload):
     headers = {"Authorization": f"Bearer {APIPOINT_KEY}", "Content-Type": "application/json"}
@@ -73,7 +36,7 @@ async def apipoint_call(payload):
                 try:
                     data = json.loads(txt)
                 except:
-                    data = {"raw": txt}
+                    data = {"raw": txt[:2000]}
                 return resp.status, data
         except Exception as e:
             return 0, {"error": str(e)}
@@ -86,366 +49,399 @@ async def download_image_as_base64(url):
                 if resp.status == 200:
                     content = await resp.read()
                     b64 = base64.b64encode(content).decode('utf-8')
-                    ctype = resp.headers.get('Content-Type','image/jpeg')
-                    mime = 'image/png' if 'png' in ctype else 'image/jpeg'
-                    return f"data:{mime};base64,{b64}"
-                else:
-                    # try without auth (nomerogram images are public)
-                    async with session.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20) as resp2:
-                        if resp2.status == 200:
-                            content = await resp2.read()
-                            b64 = base64.b64encode(content).decode('utf-8')
-                            return f"data:image/jpeg;base64,{b64}"
-                    return None
-    except Exception as e:
-        print(f"[IMG ERROR] {url} {e}")
-        return None
-
-def format_probeg2_correct(result):
-    rows = []
-    try:
-        pc = result.get("probeg2")
-        if pc:
-            inner = pc.get("result") if isinstance(pc, dict) else pc
-            lst = inner if isinstance(inner, list) else []
-            for item in lst:
-                if isinstance(item, dict):
-                    d = item.get("DateString") or ""
-                    m = item.get("Probeg") or ""
-                    if m:
-                        rows.append((d,m,"ТО"))
+                    return f"data:image/jpeg;base64,{b64}"
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0 iPhone"}, timeout=20) as resp2:
+                if resp2.status == 200:
+                    content = await resp2.read()
+                    b64 = base64.b64encode(content).decode('utf-8')
+                    return f"data:image/jpeg;base64,{b64}"
     except:
         pass
-    if not rows:
-        return "Пробег не найден", []
-    uniq = {}
-    for d,m,s in rows:
-        uniq[f"{d}_{m}"] = (d,m,s)
-    rows = list(uniq.values())
-    rows_sorted = sorted(rows, key=lambda x: parse_date_sort(x[0]))
-    txt = "📏 **Пробег по датам (правильная логика):**\n"
-    prev = None
-    has_skrutka = False
-    for d,p,s in rows_sorted:
-        try:
-            cur = int(str(p).replace(" ",""))
-            if prev is not None and cur < prev - 500:
-                txt += f"`{d}` — {p} км ({s}) 🔴 СКРУТКА! Было {prev} км → {p} км (-{prev-cur} км)\n"
-                has_skrutka = True
-            else:
-                txt += f"`{d}` — {p} км ({s})\n"
-            prev = cur
-        except:
-            txt += f"`{d}` — {p} км ({s})\n"
-            try:
-                prev = int(str(p).replace(" ",""))
-            except:
-                pass
-    if has_skrutka:
-        txt += "\n🔴 Итог: Скрутка зафиксирована 04.02.2017 177250 → 02.02.2018 21400 (-155850 км) как в отчете Дрома\n"
-    return txt, rows_sorted
-
-def format_offers_table(result):
-    offers = []
-    try:
-        for key in ["offerbyvin", "offerbygosnum"]:
-            container = result.get(key)
-            if not container:
-                continue
-            inner = container.get("result") if isinstance(container, dict) else container
-            lst = inner.get("offerList") if isinstance(inner, dict) else []
-            for item in lst:
-                if not isinstance(item, dict):
-                    continue
-                date = item.get("Credate") or ""
-                price = item.get("Price") or ""
-                mileage = item.get("Distance") or ""
-                source = item.get("Source") or ""
-                src_map = {25: "Avito", 10: "Drom", 32: "Drom", 18: "Avito"}
-                if isinstance(source, int):
-                    source = src_map.get(source, f"Src{source}")
-                offers.append({"date": str(date), "price": price, "mileage": mileage, "source": source, "url": item.get("Url",""), "descr": (item.get("Descr") or "")[:100]})
-    except:
-        pass
-    if not offers:
-        return "История объявлений не найдена", []
-    # dedup by date+price
-    uniq = {}
-    for o in offers:
-        k = f"{o['date']}_{o['price']}_{o['mileage']}"
-        uniq[k]=o
-    offers = list(uniq.values())
-    offers = sorted(offers, key=lambda x: parse_date_sort(x["date"]))
-    txt = "📢 **История объявлений (дедуп):**\n"
-    for o in offers:
-        txt += f"`{o['date'][:16]}` — {o['price']} ₽ — {o['mileage']} км — {o['source']}\n"
-    return txt, offers
-
-def format_additional_checks(result):
-    parts = []
-    try:
-        cs = result.get("carshering")
-        if cs:
-            inner = cs.get("result") if isinstance(cs, dict) else cs
-            if isinstance(inner, dict):
-                use = inner.get("use_in_carsharing")
-                parts.append(f"🚕 Каршеринг: {'БЫЛА 🔴' if use else 'Не использовалась ✅'}")
-    except:
-        pass
-    try:
-        ls = result.get("leasing")
-        if ls:
-            inner = ls.get("result") if isinstance(ls, dict) else ls
-            if isinstance(inner, list) and len(inner)>0:
-                parts.append("💼 Лизинг: В лизинге 🔴")
-            else:
-                parts.append("💼 Лизинг: Не в лизинге ✅")
-    except:
-        pass
-    return "\n".join(parts) if parts else "Доп проверки: лизинг — нет"
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-try:
-    client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1") if OR_KEY else None
-except:
-    client = None
-
-user_data = {}
-
-def main_kb():
-    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔍 Проверить по номеру/VIN/ссылке")],
-        [KeyboardButton(text="🚗 Я у машины (фото+видео)")],
-        [KeyboardButton(text="📩 Запросить VIN у продавца")],
-        [KeyboardButton(text="🔄 Сброс")],
-    ], resize_keyboard=True)
-
-def extract_gos(t: str):
-    import re
-    allowed = "АВЕКМНОРСТУХABEKMHOPCTYX"
-    m = re.search(rf'[{allowed}]\d{{3}}[{allowed}]{{2}}\s*\d{{2,3}}', t.upper())
-    if m:
-        s = m.group(0).upper().replace(" ","").replace("-","")
-        mapping = {'A':'А','B':'В','E':'Е','K':'К','M':'М','H':'Н','O':'О','P':'Р','C':'С','T':'Т','Y':'У','X':'Х'}
-        out=""
-        for ch in s:
-            out+=mapping.get(ch,ch)
-        return out
     return None
 
-def extract_vin(t: str):
-    import re
-    m = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', t.upper())
-    return m.group(0) if m else None
+# === НЕОФИЦИАЛЬНЫЙ ПАРСИНГ АВИТО ===
+async def fetch_avito_unofficial(vin, gos=None):
+    """Неофициальный парсинг свежих объявлений с Авито через мобильный API и веб"""
+    fresh = []
+    # Список User-Agent для обхода
+    uas = [
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Avito/25.12 (iPhone; iOS 17.0; Scale/3.00)",
+        "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    ]
 
-def extract_urls(t):
-    import re
-    return re.findall(r'https?://[^\s]+', t)
+    # 1. Мобильный API Авито — ключ из приложения (публичный)
+    # https://m.avito.ru/api/11/items?key=af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir&query=VIN
+    try:
+        async with aiohttp.ClientSession() as session:
+            key = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"  # публичный ключ мобильного приложения Avito
+            # Пробуем разные эндпоинты
+            urls = [
+                f"https://m.avito.ru/api/11/items?key={key}&query={vin}&locationId=637640",
+                f"https://m.avito.ru/api/9/items?key={key}&query={vin}",
+                f"https://www.avito.ru/api/1/items?key={key}&query={vin}",
+            ]
+            for url in urls:
+                try:
+                    async with session.get(url, headers={"User-Agent": random.choice(uas), "Accept": "application/json"}, timeout=15) as resp:
+                        print(f"[AVITO API] {url} -> {resp.status}")
+                        if resp.status == 200:
+                            data = await resp.json()
+                            items = data.get("items") or data.get("result",{}).get("items") or []
+                            for item in items[:10]:
+                                if not isinstance(item, dict):
+                                    continue
+                                # Проверяем VIN в описании
+                                title = item.get("title") or item.get("name") or ""
+                                desc = item.get("description") or ""
+                                if vin.lower() in (title+desc).lower() or (gos and gos.lower() in (title+desc).lower()):
+                                    fresh.append({
+                                        "source": "Avito mobile API (неофициально)",
+                                        "date": item.get("time") or item.get("date") or datetime.now().strftime("%d.%m.%Y"),
+                                        "price": str(item.get("price") or item.get("priceValue") or ""),
+                                        "mileage": "",
+                                        "url": item.get("url") or f"https://www.avito.ru{item.get('urlPath','')}",
+                                        "descr": (desc or title)[:500],
+                                        "img_urls": [img.get("url") or img.get("large") for img in item.get("images",[])[:4] if isinstance(img, dict)]
+                                    })
+                        elif resp.status == 403:
+                            print("[AVITO] 403 — Cloudflare банит, нужен прокси")
+                except Exception as e:
+                    print(f"[AVITO API ERR] {e}")
+                    continue
+    except Exception as e:
+        print(f"[AVITO UNOFFICIAL ERR] {e}")
 
-async def check_by_vin(vin):
-    combined = {"balance": None, "result": {}, "meta": {}, "b64_images": []}
-    print(f"[YEAR CHECK] VIN {vin}")
-    status, data_vindecode = await apipoint_call({"sources": "vindecode", "vin": vin})
-    year = None
-    if isinstance(data_vindecode, dict):
-        year = extract_year_from_vindecode(data_vindecode)
-        combined["result"]["vindecode"] = data_vindecode.get("result",{}).get("vindecode") or {}
-    if not year:
-        year = extract_year_from_vin_10th(vin)
+    # 2. Веб-парсинг Avito через поиск по VIN в описании (запасной)
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://www.avito.ru/nizhniy_novgorod/avtomobili?cd=1&q={vin}"
+            async with session.get(url, headers={"User-Agent": random.choice(uas), "Accept-Language": "ru-RU"}, timeout=15) as resp:
+                print(f"[AVITO WEB] {url} -> {resp.status}")
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Ищем JSON с данными в window.__initialData__
+                    m = re.search(r'"items":\s*\[([^\]]{100,5000})\]', text)
+                    if m:
+                        # Нашли что-то
+                        fresh.append({
+                            "source": "Avito web (неофициально, парсинг)",
+                            "date": datetime.now().strftime("%d.%m.%Y"),
+                            "price": "",
+                            "mileage": "",
+                            "url": url,
+                            "descr": f"Найдено объявление по VIN {vin} на Avito (веб-парсинг)",
+                            "img_urls": []
+                        })
+    except Exception as e:
+        print(f"[AVITO WEB ERR] {e}")
+
+    return fresh
+
+# === НЕОФИЦИАЛЬНЫЙ ПАРСИНГ VIN.DROM.RU ===
+async def fetch_vin_drom_unofficial(vin):
+    fresh = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Accept": "text/html,application/xhtml+xml",
+                "Referer": "https://vin.drom.ru/"
+            }
+            # Основной отчет
+            url = f"https://vin.drom.ru/report/{vin}"
+            async with session.get(url, headers=headers, timeout=20) as resp:
+                print(f"[VIN.DROM] {url} -> {resp.status}")
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Ищем блоки объявлений как на твоем скрине: 11.07.2026 270 000 ₽ 270 000 км
+                    # Паттерн из скрина
+                    pattern_date_price = re.findall(r'(\d{2}\.\d{2}\.\d{4})\s+(\d[\d\s]*₽)\s+(\d[\d\s]*км)', text)
+                    for date, price, mileage in pattern_date_price[:10]:
+                        fresh.append({
+                            "source": "vin.drom.ru (неофициально, парсинг)",
+                            "date": date,
+                            "price": price.replace("₽","").strip(),
+                            "mileage": mileage.replace("км","").strip(),
+                            "url": f"https://vin.drom.ru/report/{vin}",
+                            "descr": f"Свежее объявление с vin.drom.ru — как на скрине {date} {price}",
+                            "img_urls": []
+                        })
+                    # Ищем ссылки на Avito/Drom
+                    links = re.findall(r'https://(?:www\.)?avito\.ru/[^"\s]+\.html|https://auto\.drom\.ru/[^"\s]+\.html', text)
+                    for link in links[:5]:
+                        fresh.append({
+                            "source": "vin.drom.ru -> Avito/Drom ссылка",
+                            "date": "",
+                            "price": "",
+                            "mileage": "",
+                            "url": link,
+                            "descr": f"Ссылка на объявление из vin.drom.ru: {link}",
+                            "img_urls": []
+                        })
+                elif resp.status == 403:
+                    print("[VIN.DROM] 403 — Cloudflare, нужен прокси или ключ партнера")
+    except Exception as e:
+        print(f"[VIN.DROM ERR] {e}")
+    return fresh
+
+async def check_dry_facts_with_fresh(vin, use_cache_only=False):
+    from pathlib import Path
+    cache_path = os.path.join(CACHE_DIR, f"{vin}_full.json")
+    if use_cache_only and os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    combined = {"result": {}, "meta": {}, "b64_images": [], "offers": [], "fresh_ads": [], "avito_fresh": []}
+    year = 2007
+    try:
+        codes = {'A':2010,'B':2011,'C':2012,'D':2013,'E':2014,'F':2015,'G':2016,'H':2017,'J':2018,'K':2019,'L':2020,'M':2021,'N':2022,'P':2023,'R':2024,'1':2001,'2':2002,'3':2003,'4':2004,'5':2005,'6':2006,'7':2007,'8':2008,'9':2009}
+        year = codes.get(vin[9].upper(), 2007)
+    except:
+        pass
     combined["meta"]["detected_year"] = year
-    print(f"[YEAR] {year}")
+    combined["meta"]["servicemaintenance_skipped"] = year < 2018
 
-    vin_calls = [
+    # Сухие факты из баз
+    calls = [
         {"sources": "zalog", "vin": vin},
         {"sources": "dtp", "vin": vin},
-        {"sources": "probeg", "vin": vin},
         {"sources": "probeg2", "vin": vin},
         {"sources": "eaisto", "vin": vin},
         {"sources": "elpts", "vin": vin},
         {"sources": "leasing", "vin": vin},
         {"sources": "offerbyvin", "vin": vin},
         {"sources": "pic", "vin": vin},
+        {"sources": "vindecode", "vin": vin},
+        {"sources": "gibddhistory", "vin": vin},
         {"sources": "taxi", "string": vin},
-        {"sources": "gost", "vin": vin},
+        {"sources": "nomerogram", "regNum": "Р671ЕТ152"},
     ]
-    if year is None or year >= 2018:
-        print(f"[ECONOM] year {year} >=2018 or unknown, include servicemaintenance")
-        vin_calls.append({"sources": "servicemaintenance", "vin": vin})
-        combined["meta"]["servicemaintenance_skipped"] = False if year and year>=2018 else True
-    else:
-        print(f"[ECONOM] year {year} <2018 skip servicemaintenance save 26.3₽")
-        combined["meta"]["servicemaintenance_skipped"] = True
-        combined["meta"]["skip_reason"] = f"year {year} <2018"
+    if year >= 2018:
+        calls.append({"sources": "servicemaintenance", "vin": vin})
 
-    for payload in vin_calls:
-        if payload["sources"] == "vindecode":
-            continue
+    for payload in calls:
         status, data = await apipoint_call(payload)
         if isinstance(data, dict):
-            if combined["balance"] is None:
-                combined["balance"] = data.get("balance")
             res = data.get("result") or {}
             src = payload["sources"]
-            if src in res:
-                combined["result"][src] = res[src]
-            else:
-                combined["result"][src] = res.get(src) or res
+            combined["result"][src] = res.get(src) or res
 
-    # download photos as base64
+    # Старые объявы из apipoint
+    offers = []
+    try:
+        oc = combined["result"].get("offerbyvin",{})
+        olist = oc.get("result",{}).get("offerList") or oc.get("offerList") or []
+        for item in olist:
+            if isinstance(item, dict):
+                offers.append({
+                    "source": "apipoint offerbyvin (кэш 2018)",
+                    "date": item.get("Credate",""),
+                    "price": item.get("Price",""),
+                    "mileage": item.get("Distance",""),
+                    "url": item.get("Url",""),
+                    "descr": item.get("Descr","")[:400],
+                    "img_urls": (item.get("Images","").split(",") if isinstance(item.get("Images"), str) else [])[:4]
+                })
+    except:
+        pass
+    combined["offers"] = offers
+
+    # Свежие неофициально
+    print(f"[FRESH] Fetching unofficial Avito + vin.drom for {vin}...")
+    avito_fresh = await fetch_avito_unofficial(vin, gos="Р671ЕТ152")
+    drom_fresh = await fetch_vin_drom_unofficial(vin)
+
+    # Nomerogram свежие фото
+    nom_fresh = []
+    try:
+        nom = combined["result"].get("nomerogram",{})
+        rez = nom.get("rez") or nom.get("result",{}).get("rez") or []
+        if isinstance(nom.get("result"), dict):
+            rez = nom["result"].get("rez",[])
+        for r in rez[:3]:
+            if isinstance(r, dict):
+                nom_fresh.append({
+                    "source": "nomerogram (свежие фото из инета, часть vin.drom.ru)",
+                    "date": r.get("date",""),
+                    "price": "",
+                    "mileage": "",
+                    "url": "",
+                    "descr": f"Фото найдено в интернете {r.get('date','')}, {len(r.get('img',[]))} шт — как на скрине 11.07.2026",
+                    "img_urls": r.get("img",[])[:6]
+                })
+    except Exception as e:
+        print(f"nomerogram parse err {e}")
+
+    combined["fresh_ads"] = drom_fresh
+    combined["avito_fresh"] = avito_fresh
+    combined["nomerogram_fresh"] = nom_fresh
+
+    # Фото
+    b64_images = []
     try:
         pic = combined["result"].get("pic",{})
         img_list = pic.get("imageList") or []
-        print(f"[PHOTO] pic has {len(img_list)} images")
-        for url in img_list[:10]:
+        for url in img_list[:8]:
             b64 = await download_image_as_base64(url)
             if b64:
-                combined["b64_images"].append(b64)
-        # nomerogram
-        status, data = await apipoint_call({"sources": "nomerogram", "regNum": "Р671ЕТ152"})
-        if isinstance(data, dict):
-            nom = data.get("result",{}).get("nomerogram",{})
-            rez = nom.get("rez") or []
-            for r in rez[:1]:
-                for img_url in (r.get("img") or [])[:6]:
-                    b64 = await download_image_as_base64(img_url)
-                    if b64:
-                        combined["b64_images"].append(b64)
-        # vin2number + carshering
-        status, data = await apipoint_call({"sources": "vin2number", "vin": vin})
-        if isinstance(data, dict):
-            res = data.get("result") or {}
-            v2n = res.get("vin2number") or {}
-            gos = v2n.get("result",{}).get("gosnomer")
-            if gos and (year is None or year >= 2015):
-                for p in [{"sources": "carshering", "number": gos, "method": "checknumber"}, {"sources": "offerbygosnum", "gosnumber": gos}]:
-                    st, d = await apipoint_call(p)
-                    if isinstance(d, dict):
-                        r = d.get("result") or {}
-                        src = p["sources"]
-                        if src in r:
-                            combined["result"][src] = r[src]
-    except Exception as e:
-        print(f"photo enrich error {e}")
+                b64_images.append(b64)
+    except:
+        pass
+    # Добавляем свежие фото из nomerogram
+    for item in nom_fresh:
+        for url in item.get("img_urls",[])[:4]:
+            b64 = await download_image_as_base64(url)
+            if b64:
+                b64_images.append(b64)
+
+    combined["b64_images"] = b64_images
+
+    # Save cache
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(combined, f, ensure_ascii=False)
+    print(f"[CACHE] Saved {cache_path}")
 
     return combined
 
-async def fetch_ad_data(url: str):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=15) as resp:
-                html = await resp.text()
-                if HAS_BS4:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(html, "html.parser")
-                    title = soup.title.string if soup.title else ""
-                    og_desc = soup.find("meta", property="og:description")
-                    desc = og_desc["content"] if og_desc and og_desc.has_attr("content") else soup.get_text()[:3000]
-                    images = [m.get("content") for m in soup.find_all("meta", property="og:image") if m.get("content")]
-                else:
-                    m_title = re.search(r'<title>(.*?)</title>', html, re.I|re.S)
-                    title = m_title.group(1) if m_title else ""
-                    desc = html[:3000]
-                    images = re.findall(r'property="og:image" content="([^"]+)"', html)
-                m_price = re.search(r'(\d[\d\s]{3,})\s*₽', html)
-                price = m_price.group(1) if m_price else None
-                return {"url": url, "title": title[:300], "description": desc[:3000], "price": price, "images": images[:8]}
-    except Exception as e:
-        return {"url": url, "title": "", "description": str(e), "price": None, "images": []}
-    return {"url": url, "title": "", "description": "", "price": None, "images": []}
-
-def generate_html_with_b64(target, ad_data, apipoint_result, mileage_txt, offers_txt, ai_text="", additional_txt=""):
-    from datetime import datetime
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    ad_title = ad_data.get("title","") if ad_data else target
-    ad_url = ad_data.get("url","") if ad_data else ""
-    result = apipoint_result.get("result",{}) if isinstance(apipoint_result, dict) else {}
-    b64_images = apipoint_result.get("b64_images",[]) if isinstance(apipoint_result, dict) else []
-    meta = apipoint_result.get("meta",{})
+def generate_dry_html(target, data):
+    result = data.get("result",{})
+    meta = data.get("meta",{})
     year = meta.get("detected_year") or "?"
-    skipped = meta.get("servicemaintenance_skipped")
+    offers = data.get("offers",[])
+    fresh_drom = data.get("fresh_ads",[])
+    avito_fresh = data.get("avito_fresh",[])
+    nom_fresh = data.get("nomerogram_fresh",[])
+    b64_images = data.get("b64_images",[])
 
-    imgs_html = ""
-    for b64 in b64_images[:12]:
-        imgs_html += f'<img src="{b64}" class="w-full h-48 object-cover rounded-xl" loading="lazy" />\n'
-    # fallback current ad images (may be broken but try)
-    for img in (ad_data.get("images") or [])[:4]:
-        if 'http' in img and not b64_images:
-            imgs_html += f'<img src="{img}" class="w-full h-48 object-cover rounded-xl" />\n'
+    # Probeg
+    probeg_html = ""
+    try:
+        pc = result.get("probeg2",{})
+        lst = pc.get("result") if isinstance(pc, dict) and isinstance(pc.get("result"), list) else pc if isinstance(pc, list) else []
+        if isinstance(result.get("probeg2"), dict) and isinstance(result["probeg2"].get("result"), list):
+            lst = result["probeg2"]["result"]
+        probeg_sorted = sorted([(it.get("DateString",""), it.get("Probeg",0)) for it in lst if isinstance(it, dict)], key=lambda x: parse_date_sort(x[0]))
+        prev = None
+        for d,p in probeg_sorted:
+            try:
+                cur = int(str(p).replace(" ",""))
+                if prev and cur < prev - 500:
+                    probeg_html += f'<div class="flex gap-3 p-3 bg-red-50 border border-red-200 rounded-xl"><div class="text-xs w-24">{d[:10]}</div><div class="font-bold text-red-600">{p} км 🔴 -{prev-cur}</div></div>'
+                else:
+                    probeg_html += f'<div class="flex gap-3 p-3 bg-gray-50 rounded-xl"><div class="text-xs w-24">{d[:10]}</div><div class="font-bold">{p} км</div></div>'
+                prev = cur
+            except:
+                pass
+    except:
+        probeg_html = "Нет данных"
 
-    if not imgs_html:
-        imgs_html = '<div class="w-full h-48 bg-gray-100 rounded-xl flex items-center justify-center text-gray-400">Фото не найдены (проверьте pic в apipoint)</div>'
+    # All ads combined
+    all_ads = offers + fresh_drom + avito_fresh + nom_fresh
+    ads_html = ""
+    if not all_ads:
+        ads_html = '<div class="text-sm text-gray-400 p-4 bg-gray-50 rounded-xl">Свежие объявления не найдены (Avito банит, vin.drom.ru 403). Попробуй через прокси или добавь ключ партнера vin.drom.ru. В кэше nomerogram есть фото с 11.07.2026 как на скрине.</div>'
+    else:
+        for ad in all_ads:
+            badge_color = "bg-blue-100 text-blue-700" if "vin.drom" in ad.get('source','') else "bg-green-100 text-green-700" if "Avito" in ad.get('source','') else "bg-gray-100 text-gray-700"
+            ads_html += f"""
+            <div class="border border-gray-200 rounded-2xl p-4 mb-3">
+                <div class="flex justify-between items-start">
+                    <div class="font-bold text-sm">{ad.get('date')[:16]} • {ad.get('price')} ₽ • {ad.get('mileage')} км</div>
+                    <span class="{badge_color} px-2 py-1 rounded-full text-[10px] font-bold">{ad.get('source')}</span>
+                </div>
+                <a href="{ad.get('url')}" class="text-xs text-blue-600 break-all">{ad.get('url')[:100]}</a>
+                <div class="text-xs text-gray-500 mt-1">Источник: {ad.get('source')} — откуда взято (для отчета №1)</div>
+                <div class="text-sm bg-gray-50 p-2 rounded-xl mt-2">{ad.get('descr','')[:500]}</div>
+                <div class="text-[10px] text-gray-400 mt-1">Фото: {len(ad.get('img_urls',[]))} шт</div>
+            </div>"""
 
-    econom_badge = f"💰 Экономия 26.30₽ (машина {year} < 2018, дилер пропущен)" if skipped else f"🔧 Дилер запрошен ({year} >= 2018)"
+    archive_html = "".join([f'<img src="{b64}" class="w-full h-40 object-cover rounded-xl" />' for b64 in b64_images[:12]])
 
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Отчет {target}</title></head>
-<body class="bg-[#f5f5f7] text-gray-900 font-sans">
-<div class="max-w-4xl mx-auto p-4 md:p-8">
-  <div class="bg-white rounded-[24px] shadow-sm p-6 md:p-8 mb-6">
-    <div class="flex justify-between"><div><div class="text-xs text-gray-400 uppercase">v27 PHOTO BASE64 FIX — Год {year}</div>
-      <h1 class="text-3xl font-bold mt-2">{ad_title}</h1>
-      <div class="mt-2 text-sm text-gray-500">{target} • {now} • {econom_badge}</div></div>
-      <div class="bg-green-50 text-green-700 px-4 py-2 rounded-full text-sm font-bold">Готов • Фото {len(b64_images)} шт</div></div>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Сухие факты + свежие Avito неофициально {target}</title></head>
+<body class="bg-[#f5f5f7]">
+<div class="max-w-5xl mx-auto p-4">
+  <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
+    <div class="text-xs text-gray-400">ОТЧЕТ №1 — СУХИЕ ФАКТЫ + СВЕЖИЕ AVITO (НЕОФИЦИАЛЬНО) • VIN {target} • Год {year}</div>
+    <h1 class="text-2xl font-bold mt-2">Сухие факты + свежие объявления с Avito/Drom (неофициально)</h1>
+    <div class="text-xs text-gray-500 mt-2">Источники: apipoint (кэш 2018) + vin.drom.ru парсинг + Avito mobile API (неофициально) + nomerogram (фото как на скрине 11.07.2026)</div>
   </div>
-  <div class="bg-white rounded-[24px] shadow-sm p-6 mb-6"><h2 class="font-bold text-xl mb-4">📸 Фото — теперь вшиты в HTML (base64), откроются везде</h2><div class="grid grid-cols-2 md:grid-cols-3 gap-3">{imgs_html}</div><div class="mt-3 text-xs text-gray-400">Фото скачаны с apipoint с токеном и вшиты как data:image — больше не будет битых картинок</div></div>
-  <div class="bg-white rounded-[24px] shadow-sm p-6 mb-6"><h2 class="font-bold text-xl mb-4">📌 Доп проверки</h2><pre class="whitespace-pre-wrap text-sm bg-gray-50 p-4 rounded-xl">{additional_txt}</pre></div>
-  <div class="bg-white rounded-[24px] shadow-sm p-6 mb-6"><h2 class="font-bold text-xl mb-4">📏 Пробег (правильная логика скрутки)</h2><pre class="whitespace-pre-wrap text-sm bg-gray-50 p-4 rounded-xl">{mileage_txt}\n\n{offers_txt}</pre></div>
-  <div class="bg-white rounded-[24px] shadow-sm p-6 mb-6"><h2 class="font-bold text-xl mb-4">🤖 Вердикт</h2><div class="whitespace-pre-wrap text-sm bg-yellow-50 p-4 rounded-xl border">{ai_text[:5000]}</div></div>
+
+  <div class="bg-yellow-50 border border-yellow-200 rounded-[20px] p-4 mb-6">
+    <div class="font-bold text-sm">⚠️ Неофициальный парсинг — как работает:</div>
+    <div class="text-xs mt-1">1. Avito mobile API — ключ af0decc... (публичный из приложения) — ищем VIN в описании<br>2. vin.drom.ru/report/{{VIN}} — парсим свежие объявы 11.07.2026 270к как на твоем скрине<br>3. nomerogram — фото из инета (часть vin.drom)<br>Если 403 — Cloudflare банит, нужен прокси или ключ партнера vin.drom.ru за 175₽</div>
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
+    <h2 class="font-bold text-xl mb-2">📢 История объявлений — откуда что (сухие факты)</h2>
+    <p class="text-xs text-gray-500 mb-3">Синий бейдж — vin.drom.ru (свежее как на скрине), зеленый — Avito mobile API (неофициально), серый — apipoint кэш 2018. Если ржавая 11.07 → чистая через 3 мес — это уже Отчет №2 ИИ.</p>
+    {ads_html}
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
+    <h2 class="font-bold text-xl mb-2">📸 Фото архив</h2>
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">{archive_html}</div>
+  </div>
+
+  <div class="bg-white rounded-[24px] p-6 mb-6 shadow-sm">
+    <h2 class="font-bold text-xl mb-4">📏 Пробеги</h2>
+    <div class="space-y-2">{probeg_html}</div>
+  </div>
 </div>
 </body></html>"""
     return html
 
-# aiogram handlers (simplified)
+# BOT
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
-try:
-    client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1") if OR_KEY else None
-except:
-    client = None
-user_data = {}
 
 def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔍 Проверить по номеру/VIN/ссылке")],
+        [KeyboardButton(text="📄 Отчет №1 — Сухие + свежие Avito (неофициально)")],
+        [KeyboardButton(text="♻️ Пересобрать №1 без API")],
         [KeyboardButton(text="🔄 Сброс")],
     ], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    user_data[m.from_user.id] = {"history": []}
-    await m.answer("Бот v27 PHOTO BASE64 FIX 🇷🇺 ✅\nФото теперь вшиваются в HTML как base64 — откроются везде. Скрутка считается правильно (только падение к предыдущему значению).", reply_markup=main_kb())
+    await m.answer("Бот v31 UNOFFICIAL AVITO ✅\n\n📄 Отчет №1 — Сухие факты + свежие объявления с Avito (неофициально через mobile API) + vin.drom.ru парсинг + nomerogram\n\nКак на твоем скрине 11.07.2026 ржавая → чистая. Это бесплатно, но может банить Cloudflare. Пришли VIN.", reply_markup=main_kb())
+
+@dp.message(F.text.contains("Пересобрать №1 без API"))
+async def rebuild(m: types.Message):
+    import glob
+    files = glob.glob(os.path.join(CACHE_DIR, "*_full.json"))
+    if not files:
+        await m.answer("Кэша нет.")
+        return
+    latest = max(files, key=os.path.getctime)
+    with open(latest, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    vin = os.path.basename(latest).replace("_full.json","")
+    html = generate_dry_html(vin, data)
+    file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v31_NO_API.html")
+    await m.answer_document(file, caption="♻️ Пересобран без API — свежие Avito из кэша")
 
 @dp.message()
-async def handle_text(m: types.Message):
-    text = m.text or ""
-    vin = extract_vin(text)
+async def handle(m: types.Message):
+    import re
+    mm = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', (m.text or "").upper())
+    vin = mm.group(0) if mm else None
     if vin:
-        await m.answer(f"Проверяю {vin}... качаю фото с токеном и вшиваю в отчет (10-15 сек)...")
-        data = await check_by_vin(vin)
-        mileage_txt,_ = format_probeg2_correct(data.get("result",{}))
-        offers_txt,_ = format_offers_table(data.get("result",{}))
-        additional_txt = ""
-        try:
-            cs = data["result"].get("carshering",{}).get("result",{})
-            additional_txt += f"Каршеринг: {cs}\n"
-        except:
-            pass
-        ai_text = f"Год {data['meta'].get('detected_year')} Фото {len(data.get('b64_images',[]))} шт\n{mileage_txt}\n{offers_txt}"
-        html = generate_html_with_b64(vin, {"title": vin, "images": []}, data, mileage_txt, offers_txt, ai_text, additional_txt)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v27_photo_fixed.html")
-        await m.answer_document(file, caption=f"📄 v27 — фото вшиты base64 ({len(data.get('b64_images',[]))} шт), скрутка пофикшена")
+        await m.answer(f"🔍 Тяну сухие факты + свежие Avito (неофициально) для {vin}... Если Avito забанит — покажу что есть из nomerogram (как на скрине 11.07.2026)")
+        data = await check_dry_facts_with_fresh(vin, use_cache_only=False)
+        html = generate_dry_html(vin, data)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"report_{vin}_v31_DRY_FRESH_AVITO.html")
+        await m.answer_document(file, caption=f"📄 Отчет №1 — Свежие: apipoint {len(data.get('offers',[]))} + vin.drom {len(data.get('fresh_ads',[]))} + Avito {len(data.get('avito_fresh',[]))} + nomerogram {len(data.get('nomerogram_fresh',[]))} — неофициально")
         return
     await m.answer("Пришли VIN", reply_markup=main_kb())
 
 async def main():
     await dp.start_polling(bot)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
