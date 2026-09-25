@@ -20,7 +20,7 @@ OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v57 LIVE_PICKER_REPORT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+print(f"BOOT v58 PREMIUM_FIRST_REPORT+BUTTON2_LAST_REPORT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -373,6 +373,7 @@ async def check_history(vin, reg_num=None):
     return combined
 
 def generate_history_html(target, data):
+    """v58 - Новый визуал первого отчета - Avtoteka Pro Max"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
@@ -381,8 +382,25 @@ def generate_history_html(target, data):
     probeg = data.get("probeg",[])
     all_b64 = data.get("all_b64",[])
     logs = data.get("logs",[])
+    raw = data.get("raw",{})
 
-    probeg_html = ""
+    vin = meta.get("vin") or auto.get("vin") or target
+    reg = meta.get("reg") or auto.get("gos") or "не указан"
+    model = auto.get("model") or f"Авто {vin[:3]}"
+    year = auto.get("year") or meta.get("year") or ""
+    color = auto.get("color") or ""
+    pts = auto.get("pts") or "Нет данных"
+    sts = auto.get("sts") or ""
+    engine = f"{auto.get('engine_code','')} {auto.get('engine_vol','')}".strip()
+    gearbox = auto.get("gearbox") or ""
+    owners = auto.get("owners", 0)
+    juridical = auto.get("juridical",{})
+
+    # --- Анализ пробегов для скрутки и графика ---
+    probeg_sorted = []
+    skrutka_found = None
+    skrutka_text = ""
+    max_mileage = 0
     try:
         def parse_date(s):
             import re as re2
@@ -398,58 +416,319 @@ def generate_history_html(target, data):
             except:
                 pass
             return datetime.min
-        probeg_sorted = sorted([(it.get("DateString",""), it.get("Probeg",0)) for it in probeg if isinstance(it, dict)], key=lambda x: parse_date(x[0]))
-        for d,p in probeg_sorted[-15:]:
-            probeg_html += f'<div class="flex justify-between p-3 bg-white rounded-xl border mb-2"><div class="text-sm">{d[:10]}</div><div class="font-bold">{p} км</div></div>'
-        if not probeg_html and auto.get("mileage"):
-            probeg_html = f'<div class="flex justify-between p-3 bg-white rounded-xl border mb-2"><div class="text-sm">Автотека</div><div class="font-bold text-red-600">{auto.get("mileage")} км скрутка</div></div>'
+
+        # Сортируем по дате
+        tmp = []
+        for it in probeg:
+            if isinstance(it, dict) and it.get("Probeg") is not None:
+                d = it.get("DateString","")
+                p = int(it.get("Probeg",0) or 0)
+                tmp.append((parse_date(d), d, p, it.get("Source","")))
+        tmp.sort(key=lambda x: x[0])
+        probeg_sorted = tmp
+
+        # Ищем скрутку: падение более чем на 5000 км
+        for i in range(1, len(tmp)):
+            prev_p = tmp[i-1][2]
+            cur_p = tmp[i][2]
+            if cur_p < prev_p - 5000:
+                diff = prev_p - cur_p
+                skrutka_found = {
+                    "date": tmp[i][1],
+                    "prev": prev_p,
+                    "cur": cur_p,
+                    "diff": diff,
+                    "prev_date": tmp[i-1][1]
+                }
+                skrutka_text = f"Скрутка {diff} км {tmp[i-1][1][:10]} {prev_p} → {tmp[i][1][:10]} {cur_p}"
+                break
+        if probeg_sorted:
+            max_mileage = max([x[2] for x in probeg_sorted]) if probeg_sorted else 0
+    except Exception as e:
+        probeg_sorted = []
+
+    # --- Бейджи риска ---
+    risk_mileage = "ok"
+    risk_mileage_text = "Пробег честный" if not skrutka_found else f"Скрутка -{skrutka_found['diff']} км"
+    risk_mileage_color = "bg-green-50 text-green-700 border-green-200" if not skrutka_found else "bg-red-50 text-red-700 border-red-200"
+    risk_mileage_icon = "✅" if not skrutka_found else "🚨"
+    if skrutka_found:
+        risk_mileage = "bad"
+
+    dtp_count = len(auto.get("dtp",[])) if auto.get("dtp") else 0
+    # пробуем также из raw dtp
+    try:
+        dtp_raw = raw.get("dtp",{}).get("result",{})
+        if isinstance(dtp_raw, dict) and dtp_raw.get("count"):
+            dtp_count = max(dtp_count, dtp_raw.get("count",0))
     except:
-        probeg_html = '<div class="text-sm text-gray-500">Нет данных</div>'
+        pass
 
-    b1_parts = []
-    for it in b1:
-        img_tag = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else ""
-        b1_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-purple-100 text-purple-700 rounded-full">1️⃣ PIC • {it["price"]}</span><span class="text-[11px] font-bold bg-gray-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs font-bold">{it["type"]}</div>{img_tag}</div>')
-    b1_html = "".join(b1_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">Нет архивных фото</div>'
+    risk_dtp = "ok"
+    risk_dtp_text = f"ДТП {dtp_count}" if dtp_count else "ДТП нет"
+    risk_dtp_color = "bg-green-50 text-green-700 border-green-200"
+    risk_dtp_icon = "✅"
+    if dtp_count >= 1:
+        risk_dtp = "warn"
+        risk_dtp_color = "bg-amber-50 text-amber-700 border-amber-200"
+        risk_dtp_icon = "⚠️"
+    if dtp_count >= 2 or (auto.get("dtp") and any("150000" in str(d.get("cost","")) for d in auto.get("dtp",[]))):
+        risk_dtp = "bad"
+        risk_dtp_color = "bg-red-50 text-red-700 border-red-200"
+        risk_dtp_icon = "💥"
 
-    b2_parts = []
-    for it in b2:
-        img_tag2 = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else f'<div class="w-full h-64 bg-red-50 border rounded-xl mt-3 flex items-center justify-center text-xs">carPhoto 500</div>'
-        b2_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-blue-100 text-blue-700 rounded-full">2️⃣ NOMEROGRAM • {it["price"]}</span><span class="text-[11px] font-bold bg-yellow-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs"><b>{it.get("source")}</b> • {meta.get("reg")}</div>{img_tag2}</div>')
-    b2_html = "".join(b2_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">nomerogram 0 фото</div>'
+    risk_jur = "ok"
+    risk_jur_text = "Юридика чистая"
+    risk_jur_color = "bg-green-50 text-green-700 border-green-200"
+    risk_jur_icon = "✅"
+    jur = auto.get("juridical",{})
+    if jur.get("ограничения") and "Не найден" not in str(jur.get("ограничения")):
+        risk_jur = "bad"
+        risk_jur_text = "Ограничения!"
+        risk_jur_color = "bg-red-50 text-red-700 border-red-200"
+        risk_jur_icon = "⛔"
+    if "Найдено" in str(jur.get("залог_фнп","")):
+        risk_jur = "bad"
+        risk_jur_text = "Залог!"
+        risk_jur_color = "bg-red-50 text-red-700 border-red-200"
+        risk_jur_icon = "🔒"
 
-    b3_parts = []
-    for it in b3:
-        img_tag3 = f'<img src="{it["b64"]}" class="w-full h-64 object-cover rounded-xl mt-3 border" />' if it.get("b64") else ""
-        b3_parts.append(f'<div class="bg-white rounded-[20px] p-4 border shadow-sm"><div class="flex justify-between mb-3"><span class="text-[10px] font-bold px-3 py-1 bg-green-100 text-green-700 rounded-full">3️⃣ AUTOPHOTO • {it["price"]}</span><span class="text-[11px] font-bold bg-green-100 px-3 py-1 rounded-full">📅 {it["date"]}</span></div><div class="text-xs font-bold">{it["type"]}</div>{img_tag3}</div>')
-    b3_html = "".join(b3_parts) or f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">autophoto 0 фото</div>'
+    risk_owners = "ok"
+    risk_owners_text = f"{owners} владельца" if owners else "Владельцы ?"
+    risk_owners_color = "bg-gray-50 text-gray-700 border-gray-200"
+    risk_owners_icon = "👤"
+    if isinstance(owners, int) and owners > 3:
+        risk_owners = "warn"
+        risk_owners_color = "bg-amber-50 text-amber-700 border-amber-200"
+        risk_owners_icon = "👥"
 
+    # --- График пробега SVG ---
+    chart_svg = ""
+    if probeg_sorted and len(probeg_sorted) >= 2:
+        try:
+            # нормализуем
+            vals = [x[2] for x in probeg_sorted]
+            max_v = max(vals) if vals else 1
+            min_v = min(vals) if vals else 0
+            range_v = max_v - min_v if max_v != min_v else max_v
+            # точки
+            w = 600
+            h = 160
+            pad = 20
+            points = []
+            for idx, (dt, d_str, p, src) in enumerate(probeg_sorted):
+                x = pad + (idx / (len(probeg_sorted)-1)) * (w - pad*2) if len(probeg_sorted) > 1 else w/2
+                y = h - pad - ((p - min_v) / range_v * (h - pad*2)) if range_v else h/2
+                points.append((x,y,p,d_str, idx))
+
+            # линия
+            path_d = "M " + " L ".join([f"{x:.1f},{y:.1f}" for x,y,_,_,_ in points])
+            circles = ""
+            for x,y,p,d_str, idx in points:
+                # скрутка точка красная
+                is_skrutka = False
+                if skrutka_found and idx > 0:
+                    prev_p = probeg_sorted[idx-1][2]
+                    cur_p = probeg_sorted[idx][2]
+                    if cur_p < prev_p - 5000:
+                        is_skrutka = True
+                color = "#ef4444" if is_skrutka else "#6366f1"
+                r = "6" if is_skrutka else "4"
+                circles += f'<circle cx="{x}" cy="{y}" r="{r}" fill="{color}" stroke="white" stroke-width="2"/><text x="{x}" y="{h-2}" text-anchor="middle" font-size="9" fill="#9ca3af">{d_str[:10]}</text>'
+
+            chart_svg = f'''
+            <div class="bg-white rounded-[20px] p-4 border mt-3 overflow-x-auto">
+              <svg viewBox="0 0 {w} {h}" class="w-full h-[180px]">
+                <rect x="0" y="0" width="{w}" height="{h}" rx="12" fill="#f9fafb"/>
+                <path d="{path_d}" fill="none" stroke="#6366f1" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                {circles}
+              </svg>
+              <div class="text-[10px] text-gray-400 mt-2">Мин {min_v} км • Макс {max_v} км • Записей {len(probeg_sorted)} • {"🚨 Скрутка обнаружена" if skrutka_found else "✅ Пробег без резких падений"}</div>
+            </div>
+            '''
+        except Exception as e:
+            chart_svg = f'<div class="text-xs text-gray-400">График ошибка: {e}</div>'
+    else:
+        chart_svg = '<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">Нет данных пробега для графика</div>'
+
+    # --- Список пробегов ---
+    probeg_list_html = ""
+    for dt, d_str, p, src in reversed(probeg_sorted[-12:]):  # последние сверху
+        is_drop = False
+        if skrutka_found and d_str == skrutka_found["date"]:
+            is_drop = True
+        bg = "bg-red-50 border-red-200" if is_drop else "bg-white border-gray-100"
+        badge = '<span class="text-[9px] bg-red-600 text-white px-2 py-0.5 rounded-full">СКРУТКА</span>' if is_drop else ''
+        probeg_list_html += f'<div class="flex justify-between items-center p-3 {bg} rounded-xl border mb-2"><div class="text-[13px]">{d_str[:10]} <span class="text-[10px] text-gray-400">{src}</span> {badge}</div><div class="font-bold text-[14px]">{p} км</div></div>'
+    if not probeg_list_html:
+        probeg_list_html = '<div class="text-sm text-gray-500 p-3">Нет записей probeg2</div>'
+        if auto.get("mileage"):
+            probeg_list_html = f'<div class="flex justify-between p-3 bg-amber-50 border border-amber-200 rounded-xl mb-2"><div class="text-sm">Автотека</div><div class="font-bold text-red-600">{auto.get("mileage")} км</div></div>'
+
+    # --- ДТП таймлайн ---
     dtp_parts = []
-    for d in auto.get("dtp",[]):
+    for idx, d in enumerate(auto.get("dtp",[])):
         paint = "".join([f"<li>{x}</li>" for x in d.get("paint",[])])
         replace = "".join([f"<li>{x}</li>" for x in d.get("replace",[])])
         aux = "".join([f"<li>{x}</li>" for x in d.get("aux",[])])
-        badge_class = "bg-red-100 text-red-700" if "Легкие" in d.get("damage","") else "bg-gray-100"
-        paint_block = f'<div class="mt-3"><b class="text-xs">Окраска:</b><ul class="text-xs list-disc pl-5 mt-1 bg-yellow-50 p-2 rounded-xl">{paint}</ul></div>' if paint else ""
-        replace_block = f'<div class="mt-2"><b class="text-xs">Замена:</b><ul class="text-xs list-disc pl-5 mt-1 bg-blue-50 p-2 rounded-xl">{replace}</ul></div>' if replace else ""
-        aux_block = f'<div class="mt-2"><b class="text-xs">Вспомогательные:</b><ul class="text-xs list-disc pl-5 mt-1 bg-gray-50 p-2 rounded-xl">{aux}</ul></div>' if aux else ""
-        dtp_parts.append(f'<div class="bg-white rounded-[16px] p-5 border mb-4"><div class="flex justify-between"><div><div class="font-bold text-lg">{d["date"]}</div><div class="text-xs text-gray-500 mt-1">{d["type"]} • {d.get("region","")}</div></div><div class="text-xs px-3 py-1 rounded-full {badge_class}">{d["damage"]}</div></div><div class="text-xs mt-3"><b>Участников:</b> {d.get("participants","")} • <b>Расчет:</b> {d.get("cost","")}</div>{paint_block}{replace_block}{aux_block}</div>')
-    dtp_html = "".join(dtp_parts) or '<div class="bg-white rounded-[16px] p-5 border text-sm">ДТП нет</div>'
+        is_serious = "150000" in str(d.get("cost","")) or "Задняя" in "".join(d.get("paint",[]) + d.get("replace",[]))
+        dot_color = "bg-red-500" if is_serious else "bg-amber-400" if "Легкие" in d.get("damage","") else "bg-gray-300"
+        paint_block = f'<div class="mt-2"><b class="text-[11px]">Окраска:</b><ul class="text-[11px] list-disc pl-5 mt-1 bg-yellow-50 p-2 rounded-xl">{paint}</ul></div>' if paint else ""
+        replace_block = f'<div class="mt-2"><b class="text-[11px]">Замена:</b><ul class="text-[11px] list-disc pl-5 mt-1 bg-blue-50 p-2 rounded-xl">{replace}</ul></div>' if replace else ""
+        aux_block = f'<div class="mt-2"><b class="text-[11px]">Работы:</b><ul class="text-[11px] list-disc pl-5 mt-1 bg-gray-50 p-2 rounded-xl">{aux}</ul></div>' if aux else ""
+        badge_class = "bg-red-100 text-red-700 border-red-200" if is_serious else "bg-amber-50 text-amber-700 border-amber-200" if "Легкие" in d.get("damage","") else "bg-gray-100 text-gray-600"
+        dtp_parts.append(f'''
+        <div class="relative flex gap-4">
+          <div class="flex flex-col items-center">
+            <div class="w-3 h-3 rounded-full {dot_color} border-2 border-white shadow"></div>
+            <div class="w-0.5 flex-1 bg-gray-200 mt-1"></div>
+          </div>
+          <div class="bg-white rounded-[16px] p-4 border mb-4 flex-1">
+            <div class="flex justify-between items-start">
+              <div><div class="font-bold text-[15px]">{d["date"]}</div><div class="text-[11px] text-gray-500 mt-1">{d["type"]} • {d.get("region","")}</div></div>
+              <div class="text-[11px] px-2.5 py-1 rounded-full border {badge_class}">{d["damage"]}</div>
+            </div>
+            <div class="text-[11px] mt-2 text-gray-600">Участников: {d.get("participants","")} • Расчет: <b>{d.get("cost","")}</b></div>
+            {paint_block}{replace_block}{aux_block}
+          </div>
+        </div>
+        ''')
+    dtp_html = "".join(dtp_parts) if dtp_parts else '<div class="bg-white rounded-[16px] p-6 border text-sm text-gray-500">ДТП по базам не найдено — чистый кузов по базам</div>'
 
+    # --- Фото блоки ---
+    def build_photo_block(items, title, price, empty_text):
+        if not items:
+            return f'<div class="bg-white rounded-[20px] p-6 border text-sm text-gray-500">{empty_text}</div>'
+        parts = []
+        for it in items[:20]:
+            img_tag = f'<img src="{it.get("b64","")}" class="w-full h-56 object-cover rounded-xl mt-3 border" loading="lazy"/>' if it.get("b64") else f'<div class="w-full h-56 bg-gray-100 border rounded-xl mt-3 flex items-center justify-center text-[11px] text-gray-400">Фото без загрузки<br>{it.get("url","")[:40]}</div>'
+            date = it.get("date") or it.get("desc") or ""
+            parts.append(f'''
+            <div class="bg-white rounded-[20px] p-3 border shadow-sm">
+              <div class="flex justify-between mb-2">
+                <span class="text-[9px] font-bold px-2 py-1 bg-gray-900 text-white rounded-full">{title} • {price}</span>
+                <span class="text-[10px] font-bold bg-gray-100 px-2 py-1 rounded-full">📅 {date}</span>
+              </div>
+              {img_tag}
+              <div class="text-[11px] mt-2 text-gray-600 truncate">{it.get("url","")[:60]}</div>
+            </div>
+            ''')
+        return "".join(parts)
+
+    b1_html = build_photo_block(b1, "1️⃣ PIC архив VIN", "1.50₽", "Нет архивных фото по VIN")
+    b2_html = build_photo_block(b2, "2️⃣ NOMEROGRAM", "1.30₽", "Нет свежих фото из объявлений (госномер не найден или нет объявлений)")
+    b3_html = build_photo_block(b3, "3️⃣ AUTOPHOTO улицы", "1.60₽", "Нет уличных фото")
+
+    # --- Итоговый HTML ---
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>История {target} v52</title></head>
-<body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
-  <div class="bg-white card p-6 shadow-sm border rounded-[24px]">
-    <div class="text-[11px] text-gray-400 tracking-widest">КНОПКА 1 • ПРОВЕРКА ИСТОРИИ ПО VIN • v52 • {len(all_b64)} фото</div>
-    <h1 class="text-[28px] font-bold mt-1 leading-none">{auto.get('model')} {auto.get('year')}</h1>
-    <div class="text-sm text-gray-600 mt-1">{auto.get('vin')} • {auto.get('gos')} • {auto.get('color')}</div>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style>
+<title>История {vin} v58</title></head>
+<body class="bg-[#f2f2f7]"><div class="max-w-[980px] mx-auto p-3 md:p-6">
+
+  <!-- HEADER -->
+  <div class="bg-white card p-6 shadow-sm border rounded-[28px]">
+    <div class="flex justify-between items-start">
+      <div>
+        <div class="text-[10px] tracking-[0.2em] text-gray-400 font-bold">КНОПКА 1 • ИСТОРИЯ АВТО • v58 PREMIUM • {len(all_b64)} фото</div>
+        <h1 class="text-[28px] font-extrabold mt-2 leading-none tracking-tight">{model} {year}</h1>
+        <div class="text-[13px] text-gray-600 mt-2 flex flex-wrap gap-2">
+          <span class="bg-gray-900 text-white px-2.5 py-1 rounded-full text-[11px]">VIN {vin}</span>
+          <span class="bg-white border px-2.5 py-1 rounded-full text-[11px]">Гос {reg}</span>
+          <span class="bg-white border px-2.5 py-1 rounded-full text-[11px]">{color}</span>
+          <span class="bg-white border px-2.5 py-1 rounded-full text-[11px]">ПТС {pts}</span>
+        </div>
+      </div>
+      <div class="hidden md:block text-right">
+        <div class="text-[10px] text-gray-400">Двигатель</div>
+        <div class="font-bold text-[13px]">{engine or '—'}</div>
+        <div class="text-[10px] text-gray-400 mt-2">КПП</div>
+        <div class="font-bold text-[13px]">{gearbox or '—'}</div>
+      </div>
+    </div>
+
+    <!-- RISK BADGES -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-6">
+      <div class="rounded-[16px] p-3 border {risk_mileage_color}">
+        <div class="text-[10px] opacity-70">{risk_mileage_icon} ПРОБЕГ</div>
+        <div class="font-bold text-[13px] mt-1">{risk_mileage_text}</div>
+        <div class="text-[11px] opacity-70">{max_mileage} км макс</div>
+      </div>
+      <div class="rounded-[16px] p-3 border {risk_dtp_color}">
+        <div class="text-[10px] opacity-70">{risk_dtp_icon} ДТП</div>
+        <div class="font-bold text-[13px] mt-1">{risk_dtp_text}</div>
+        <div class="text-[11px] opacity-70">{'Есть расчет Audatex' if any('150000' in str(d.get('cost','')) for d in auto.get('dtp',[])) else 'По базам'}</div>
+      </div>
+      <div class="rounded-[16px] p-3 border {risk_jur_color}">
+        <div class="text-[10px] opacity-70">{risk_jur_icon} ЮРИДИКА</div>
+        <div class="font-bold text-[13px] mt-1">{risk_jur_text}</div>
+        <div class="text-[11px] opacity-70">{'Чистая' if risk_jur=='ok' else 'Требует проверки'}</div>
+      </div>
+      <div class="rounded-[16px] p-3 border {risk_owners_color}">
+        <div class="text-[10px] opacity-70">{risk_owners_icon} ВЛАДЕЛЬЦЫ</div>
+        <div class="font-bold text-[13px] mt-1">{risk_owners_text}</div>
+        <div class="text-[11px] opacity-70">ПТС {pts[:12]}</div>
+      </div>
+    </div>
   </div>
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Сведения • ПТС {auto.get('pts')} • {auto.get('engine_code')} • {auto.get('gearbox')}</h2><div class="grid grid-cols-2 md:grid-cols-3 gap-3 mt-4 text-sm"><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">ПТС</div><div class="font-bold">{auto.get('pts')}</div></div><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">Двигатель</div><div class="font-bold">{auto.get('engine_code')} • {auto.get('engine_vol')}</div></div><div class="bg-[#f5f5f7] rounded-xl p-3"><div class="text-[10px] text-gray-500">КПП</div><div class="font-bold">{auto.get('gearbox')}</div></div></div></div>
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Юридика</h2><div class="grid grid-cols-2 gap-2 mt-4 text-xs"><div class="p-3 bg-green-50 rounded-xl border">Ограничения: {auto.get('juridical',{}).get('ограничения')} • Розыск: {auto.get('juridical',{}).get('розыск')}</div><div class="p-3 bg-green-50 rounded-xl border">Залог: {auto.get('juridical',{}).get('залог_фнп')} • Лизинг: {auto.get('juridical',{}).get('лизинг')}</div></div></div>
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">ДТП • Audatex</h2><div class="mt-4">{dtp_html}</div></div>
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Пробеги</h2><div class="mt-4">{probeg_html}</div></div>
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]"><h2 class="font-bold text-[18px]">Фото • 3 блока</h2><h3 class="font-bold mt-4 text-sm">1️⃣ архив по VIN pic 1.50₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b1_html}</div><h3 class="font-bold mt-6 text-sm">2️⃣ номерограм 1.30₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b2_html}</div><h3 class="font-bold mt-6 text-sm">3️⃣ фото пользователей 1.60₽</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">{b3_html}</div></div>
-  <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl">{"<br>".join(logs[-40:])}</div></div>
+
+  <!-- СВЕДЕНИЯ -->
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[28px]">
+    <h2 class="font-extrabold text-[16px]">📋 Сведения • Паспорт ТС</h2>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 text-[13px]">
+      <div class="bg-[#f8f8fb] rounded-[16px] p-3 border"><div class="text-[10px] text-gray-500 font-bold tracking-widest">ПТС</div><div class="font-bold mt-1">{pts}</div><div class="text-[10px] text-gray-400">{sts}</div></div>
+      <div class="bg-[#f8f8fb] rounded-[16px] p-3 border"><div class="text-[10px] text-gray-500 font-bold tracking-widest">ДВИГАТЕЛЬ</div><div class="font-bold mt-1">{auto.get('engine_code','—')}</div><div class="text-[11px] text-gray-600">{auto.get('engine_vol','')}</div></div>
+      <div class="bg-[#f8f8fb] rounded-[16px] p-3 border"><div class="text-[10px] text-gray-500 font-bold tracking-widest">КПП / ТИП</div><div class="font-bold mt-1">{gearbox or '—'}</div><div class="text-[11px] text-gray-600">{auto.get('type','')}</div></div>
+      <div class="bg-[#f8f8fb] rounded-[16px] p-3 border"><div class="text-[10px] text-gray-500 font-bold tracking-widest">ЦВЕТ / КУЗОВ</div><div class="font-bold mt-1">{color or '—'}</div><div class="text-[11px] text-gray-600">{auto.get('body_number','')[:10]}</div></div>
+    </div>
+  </div>
+
+  <!-- ЮРИДИКА -->
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[28px]">
+    <h2 class="font-extrabold text-[16px]">⚖️ Юридика • Проверка по базам</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 text-[12px]">
+      <div class="p-4 bg-green-50 rounded-[16px] border border-green-100"><div class="font-bold">Ограничения ГИБДД</div><div class="mt-1">{juridical.get('ограничения','Не найдены')} • Розыск: {juridical.get('розыск','Нет')}</div></div>
+      <div class="p-4 bg-green-50 rounded-[16px] border border-green-100"><div class="font-bold">Залог ФНП / Лизинг</div><div class="mt-1">{juridical.get('залог_фнп','Не найден')} • Лизинг: {juridical.get('лизинг','Не найден')}</div></div>
+      <div class="p-4 bg-gray-50 rounded-[16px] border"><div class="font-bold">ПТС наличие / Штрафы</div><div class="mt-1">{juridical.get('птс_наличие','Есть')} • Штрафы: {juridical.get('штрафы','Не найдены')}</div></div>
+      <div class="p-4 bg-gray-50 rounded-[16px] border"><div class="font-bold">Регистрация</div><div class="mt-1">{juridical.get('регистрация_гибдд','Зарегистрирован')}</div></div>
+    </div>
+  </div>
+
+  <!-- ДТП ТАЙМЛАЙН -->
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[28px]">
+    <h2 class="font-extrabold text-[16px]">💥 ДТП • Audatex расчет • Таймлайн</h2>
+    <div class="mt-6">{dtp_html}</div>
+  </div>
+
+  <!-- ПРОБЕГИ -->
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[28px]">
+    <div class="flex justify-between items-center">
+      <h2 class="font-extrabold text-[16px]">⏱️ Пробеги • {len(probeg_sorted)} записей</h2>
+      <span class="text-[10px] px-3 py-1 rounded-full border {risk_mileage_color} font-bold">{risk_mileage_text}</span>
+    </div>
+    {chart_svg}
+    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-2">{probeg_list_html}</div>
+    {'<div class="mt-3 p-3 bg-red-50 border border-red-200 rounded-xl text-[12px]"><b>🚨 Скрутка обнаружена:</b> '+skrutka_text+' — реальный пробег '+str(max_mileage)+' км, на приборке будет меньше. Торг 30-50к.</div>' if skrutka_found else '<div class="mt-3 p-3 bg-green-50 border border-green-200 rounded-xl text-[12px]">✅ Резких падений пробега не найдено — пробег выглядит честным.</div>'}
+  </div>
+
+  <!-- ФОТО 3 БЛОКА -->
+  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[28px]">
+    <h2 class="font-extrabold text-[16px]">📸 Фото • 3 блока • {len(all_b64)} фото скачано</h2>
+    <div class="text-[11px] text-gray-500 mt-1">1️⃣ архив по VIN (pic) 1.50₽ • 2️⃣ свежие объявления (nomerogram) 1.30₽ • 3️⃣ уличные (autophoto) 1.60₽</div>
+    
+    <h3 class="font-bold mt-6 text-[13px]">1️⃣ Архив по VIN • {len(b1)} фото</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">{b1_html}</div>
+    
+    <h3 class="font-bold mt-8 text-[13px]">2️⃣ Номераграм • {len(b2)} фото • Гос {reg}</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">{b2_html}</div>
+    
+    <h3 class="font-bold mt-8 text-[13px]">3️⃣ Фото пользователей • {len(b3)} фото</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">{b3_html}</div>
+  </div>
+
+  <div class="bg-white card p-4 mt-4 border rounded-[28px]"><div class="text-[10px] font-bold tracking-widest text-gray-400">ЛОГИ ОТЛАДКИ</div><div class="text-[10px] font-mono bg-gray-50 p-3 rounded-xl mt-2 max-h-40 overflow-auto">{"<br>".join(logs[-40:])}</div></div>
 </div></body></html>"""
     return html
 
@@ -825,11 +1104,11 @@ async def handle(m: types.Message):
             await m.answer("Нет последнего VIN, пришли VIN заново", reply_markup=main_kb())
             return
         reg_last = LAST_REQUEST.get("reg")
-        await m.answer(f"🔄 Пересобираю визуал v52 для {vin} + {reg_last}...")
+        await m.answer(f"🔄 Пересобираю визуал v58 PREMIUM для {vin} + {reg_last}...")
         data = await check_history(vin, reg_last)
         html = generate_history_html(f"{vin}_rebuild", data)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v52_REBUILD.html")
-        await m.answer_document(file, caption=f"🔄 Пересобран визуал: {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v58_REBUILD.html")
+        await m.answer_document(file, caption=f"🔄 Пересобран PREMIUM визуал: {len(data.get('all_b64',[]))} фото • График + таймлайн", reply_markup=main_kb())
         return
 
     # Кнопка 3 - Проверка у капота
@@ -850,30 +1129,52 @@ async def handle(m: types.Message):
     # Кнопка 2 - Предварительные рекомендации ИИ + OpenRouter реальный запрос
     if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
         global LAST_REPORT_DATA
-        if not LAST_REPORT_DATA or not LAST_REPORT_DATA.get("meta"):
+        # --- FIX v58: Кнопка 2 работает без Кнопки 1, берет последний отчет чтобы не разоряться ---
+        vin_for_ai = None
+        if mm_vin:
+            vin_for_ai = mm_vin.group(0)
+        elif LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin"):
+            vin_for_ai = LAST_REPORT_DATA.get("meta",{}).get("vin")
+        elif LAST_REQUEST.get("vin"):
+            vin_for_ai = LAST_REQUEST.get("vin")
+
+        if not vin_for_ai:
             await m.answer(
-                f"Сначала сделай Кнопку 1️⃣ Проверка истории авто по VIN — нужен отчет для анализа\n\n"
-                f"Пришли VIN, я соберу историю, потом нажми 2️⃣ Предварительные рекомендации ИИ — сформирую отчет файлом на основе данных из первого отчета, прикинусь автоподборщиком, дам полный анализ стыковок фото",
+                f"Пришли VIN для ИИ разбора — я сам подтяну историю и сделаю рекомендации.\n\n"
+                f"Например: W0L0AHL3582033491\n"
+                f"Или нажми 1️⃣ если хочешь сначала посмотреть историю.",
                 reply_markup=main_kb()
             )
             return
-        if mm_vin:
-            vin = mm_vin.group(0)
-            if LAST_REPORT_DATA.get("meta",{}).get("vin") != vin:
-                await m.answer(f"Для {vin} сначала сделай Кнопку 1️⃣, потом 2️⃣ — данные для анализа берутся из первого отчета", reply_markup=main_kb())
+
+        # Если есть уже готовый отчет для этого VIN — берем его, не тратим деньги на Apipoint
+        if LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin") == vin_for_ai:
+            data_for_ai = LAST_REPORT_DATA
+            await m.answer(f"🤖 Беру последний отчет для {vin_for_ai} — формирую рекомендации ИИ через {OPENROUTER_MODEL}... 15-30 сек ⏳")
+        else:
+            # Нет отчета или другой VIN — делаем историю один раз, потом сразу ИИ (экономим клики клиента)
+            await m.answer(f"🤖 Для {vin_for_ai} нет свежего отчета в памяти — собираю историю (1-2 мин) и сразу сделаю ИИ разбор через {OPENROUTER_MODEL}... ⏳\n\nЧтобы не платить дважды, в следующий раз сначала жми 1️⃣, потом 2️⃣ — тогда 2️⃣ возьмет последний отчет без доп. запросов.")
+            try:
+                data_for_ai = await check_history(vin_for_ai, reg)
+                # сразу отдаем первый отчет тоже, чтобы клиент видел что происходит
+                html_hist = generate_history_html(vin_for_ai, data_for_ai)
+                file_hist = BufferedInputFile(html_hist.encode('utf-8'), filename=f"History_{vin_for_ai}_v58_PREMIUM.html")
+                await m.answer_document(file_hist, caption=f"1️⃣ История {vin_for_ai} • {data_for_ai.get('meta',{}).get('reg')} • {len(data_for_ai.get('all_b64',[]))} фото — теперь делаю ИИ разбор", reply_markup=main_kb())
+            except Exception as e:
+                await m.answer(f"❌ Не смог собрать историю для {vin_for_ai}: {e}", reply_markup=main_kb())
                 return
-        vin_for_ai = LAST_REPORT_DATA.get('meta',{}).get('vin')
-        await m.answer(f"🤖 Формирую рекомендации ИИ для {vin_for_ai} — делаю запрос в OpenRouter {OPENROUTER_MODEL}... Анализ ДТП, пробегов, стыковок фото займет 15-30 сек ⏳")
-        # Собираем промпт и кидаем в OpenRouter
-        prompt = build_prompt_for_openrouter(LAST_REPORT_DATA)
+
+        # Теперь ИИ
+        await m.answer(f"🤖 Формирую живой разбор подборщика для {vin_for_ai}...")
+        prompt = build_prompt_for_openrouter(data_for_ai)
         ai_text, ai_error = await call_openrouter_ai(prompt)
         if ai_text:
-            await m.answer(f"✅ ИИ ответил, собираю итоговый отчет для {vin_for_ai}...")
+            await m.answer(f"✅ ИИ ответил, собираю итоговый отчет v58 LIVE для {vin_for_ai}...")
         else:
             await m.answer(f"⚠️ OpenRouter не ответил: {ai_error} — сделаю отчет на шаблонах")
-        html = generate_ai_recommendations_html(LAST_REPORT_DATA, ai_text=ai_text, ai_error=ai_error)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{vin_for_ai}_v53_OPENROUTER.html")
-        caption = f"2️⃣ ИИ рекомендации для {vin_for_ai} — OpenRouter {OPENROUTER_MODEL}\n" + (ai_text[:500] + "..." if ai_text and len(ai_text)>500 else (ai_text[:500] if ai_text else f"Ошибка: {ai_error}"))
+        html = generate_ai_recommendations_html(data_for_ai, ai_text=ai_text, ai_error=ai_error)
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{vin_for_ai}_v58_LIVE.html")
+        caption = f"2️⃣ ИИ рекомендации LIVE для {vin_for_ai} — {OPENROUTER_MODEL}\n" + (ai_text[:600] + "..." if ai_text and len(ai_text)>600 else (ai_text[:600] if ai_text else f"Ошибка: {ai_error}"))
         await m.answer_document(file, caption=caption[:1000], reply_markup=main_kb())
         return
 
@@ -881,11 +1182,11 @@ async def handle(m: types.Message):
     if "проверка истории" in txt_low or "истории авто" in txt_low or txt_low.startswith("1️⃣") or mm_vin:
         if mm_vin:
             vin = mm_vin.group(0)
-            await m.answer(f"Принял VIN {vin} 👍\n\nСобираю отчет по истории — ДТП, пробеги, юридика и все фото из объявлений.\n\nЗаймет 1-2 минуты ⏳ Не уходи, пришлю файл как будет готово.")
+            await m.answer(f"Принял VIN {vin} 👍\n\nСобираю PREMIUM отчет по истории — с графиком пробега, таймлайном ДТП и риск-бейджами.\n\nЗаймет 1-2 минуты ⏳")
             data = await check_history(vin, reg)
             html = generate_history_html(vin, data)
-            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v52_FULL.html")
-            await m.answer_document(file, caption=f"1️⃣ История авто по VIN: {vin} • {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • Теперь нажми 2️⃣ Предварительные рекомендации ИИ для анализа стыковок фото", reply_markup=main_kb())
+            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v58_PREMIUM.html")
+            await m.answer_document(file, caption=f"1️⃣ PREMIUM История {vin} • {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • График пробега + таймлайн ДТП • Теперь 2️⃣ возьмет этот отчет без доп. оплаты", reply_markup=main_kb())
             return
         if txt_low.startswith("1️⃣"):
             await m.answer("Пришли VIN для проверки истории (Кнопка 1)", reply_markup=main_kb())
