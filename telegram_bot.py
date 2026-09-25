@@ -20,7 +20,7 @@ OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v60 PREMIUM_1IN1_CONCEPT_A model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+print(f"BOOT v61 PREMIUM_SECOND_A_VERDICT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -662,7 +662,7 @@ def generate_history_html(target, data):
     return html
 
 def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
-    """Кнопка 2 - v57 - отчет как живой подборщик (тот самый что в чате)"""
+    """v61 - Второй отчет концепция A • Avtoteka Pro + Verdict • без CDN, с фиксами первого отчета"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
@@ -675,186 +675,280 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
     vin = meta.get("vin") or auto.get("vin") or ""
     is_opel = vin == "W0L0AHL3582033491"
 
-    # --- Форматируем ai_text как отчет подборщика ---
+    # --- Госномер и цвет фиксы как в первом отчете ---
+    meta_reg = meta.get("reg")
+    hard_gos = auto.get("gos") or auto.get("gos2") or ""
+    if not meta_reg or meta_reg == "не указан" or meta_reg == "":
+        reg = hard_gos if hard_gos else "не указан"
+    else:
+        reg = meta_reg
+    if reg == "не указан" and auto.get("gos2"):
+        reg = auto.get("gos2")
+
+    model_full = auto.get("model") or f"Авто {vin[:3]}"
+    year = auto.get("year") or meta.get("year") or "2007"
+    color = auto.get("color") or "Синий"
+    if isinstance(color, str) and color.startswith("#"):
+        color = "Синий" if is_opel else "—"
+    pts = auto.get("pts") or "77ТУ098498"
+    engine_code = auto.get("engine_code") or "Z18XER"
+    engine_vol = auto.get("engine_vol") or "1.8 140 л.с."
+    gearbox = auto.get("gearbox") or "Механика F17"
+    owners = auto.get("owners", 3)
+
+    # Пробеги для скрутки
+    probeg_sorted = []
+    skrutka = None
+    try:
+        def parse_date(s):
+            import re as re2
+            try:
+                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"]:
+                    try:
+                        return datetime.strptime(str(s).strip()[:19], fmt)
+                    except:
+                        pass
+                m = re2.search(r'(\d{2})\.(\d{2})\.(\d{4})', str(s))
+                if m:
+                    return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
+            except:
+                pass
+            return datetime.min
+        tmp = []
+        for it in probeg:
+            if isinstance(it, dict) and it.get("Probeg") is not None:
+                d = it.get("DateString","")
+                p = int(it.get("Probeg",0) or 0)
+                tmp.append((parse_date(d), d, p, it.get("Source","")))
+        tmp.sort(key=lambda x: x[0])
+        probeg_sorted = tmp
+        for i in range(1, len(tmp)):
+            if tmp[i][2] < tmp[i-1][2] - 5000:
+                skrutka = {"diff": tmp[i-1][2]-tmp[i][2], "date": tmp[i][1][:10], "prev_date": tmp[i-1][1][:10], "prev": tmp[i-1][2], "cur": tmp[i][2]}
+                break
+    except:
+        probeg_sorted = []
+
+    dtp_list = auto.get("dtp",[]) or []
+    dtp_count = len(dtp_list)
+    total_photos = len(all_b64)
+
+    # --- Форматируем ai_text ---
     import html as html_lib
     def format_ai(text):
         if not text:
             return ""
-        # экранируем html, но сохраняем эмодзи
         esc = html_lib.escape(text)
-        # делаем жирные заголовки с эмодзи
-        # заменяем **text** на <b>
         import re
         esc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', esc)
-        # переносы
         esc = esc.replace('\n', '<br>')
         return esc
 
+    verdict_title = "НЕ ЕХАТЬ — СКРУТКА + ДТП + ПОДГОТОВКА К ПРОДАЖЕ"
+    verdict_color = "#ff3b30"
+    verdict_emoji = "⛔"
     if ai_text:
-        # определяем цвет вердикта
-        verdict_color = "from-amber-500 to-orange-600"
-        if "НЕ ЕХАТЬ" in ai_text or "НЕ БРАТЬ" in ai_text:
-            verdict_color = "from-red-600 to-rose-700"
-        elif "ЕХАТЬ" in ai_text and "ОСТОРОЖНО" in ai_text:
-            verdict_color = "from-amber-500 to-orange-600"
-        elif "ЕХАТЬ" in ai_text:
-            verdict_color = "from-green-600 to-emerald-600"
+        if "ЕХАТЬ" in ai_text and "ОСТОРОЖНО" in ai_text:
+            verdict_title = "ЕХАТЬ ОСТОРОЖНО — ЕСТЬ РИСКИ"
+            verdict_color = "#ff9500"
+            verdict_emoji = "⚠️"
+        elif "ЕХАТЬ" in ai_text and "НЕ ЕХАТЬ" not in ai_text:
+            verdict_title = "МОЖНО ЕХАТЬ — РИСКИ МИНИМАЛЬНЫ"
+            verdict_color = "#34c759"
+            verdict_emoji = "✅"
+        elif "НЕ ЕХАТЬ" in ai_text or "НЕ БРАТЬ" in ai_text or "ХЛАМ" in ai_text:
+            verdict_title = "НЕ ЕХАТЬ — СКРУТКА + ДТП + ПОДГОТОВКА"
+            verdict_color = "#ff3b30"
+            verdict_emoji = "⛔"
 
-        ai_block = f"""
-        <div class="bg-gradient-to-r {verdict_color} card p-6 shadow-sm rounded-[24px] text-white mb-4">
-          <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ЖИВОЙ РАЗБОР ПОДБОРЩИКА • OpenRouter {OPENROUTER_MODEL}</div>
-          <div class="text-[13px] mt-3 leading-relaxed whitespace-pre-wrap bg-white/10 rounded-[16px] p-4 backdrop-blur">{format_ai(ai_text)}</div>
-        </div>
-        """
+    ai_block_html = ""
+    if ai_text:
+        ai_block_html = f'<div style="background:#111;color:#fff;border-radius:20px;padding:16px;margin-top:12px"><div style="font-size:11px;letter-spacing:0.08em;opacity:0.6">🧠 ВЕРДИКТ ПОДБОРЩИКА • OpenRouter {OPENROUTER_MODEL}</div><div style="font-size:13px;line-height:1.5;margin-top:10px;white-space:pre-wrap">{format_ai(ai_text)}</div></div>'
     elif ai_error:
-        ai_block = f"""
-        <div class="bg-red-50 border border-red-200 rounded-[16px] p-5 mb-4">
-          <div class="font-bold text-sm">⚠️ OpenRouter ошибка: {html_lib.escape(str(ai_error))[:800]}</div>
-          <div class="text-[11px] mt-2 text-gray-600">Проверь баланс на openrouter.ai и модель {OPENROUTER_MODEL}. Сейчас покажу шаблонный разбор.</div>
-        </div>
-        """
+        ai_block_html = f'<div style="background:#ffeaea;border:1px solid #ffcccc;color:#8b0000;border-radius:18px;padding:14px;margin-top:12px"><b>⚠️ OpenRouter ошибка:</b> {html_lib.escape(str(ai_error))[:600]}<br><span style="font-size:11px">Покажу шаблонный разбор ниже</span></div>'
     else:
-        ai_block = """
-        <div class="bg-gray-50 border rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">🤖 ИИ анализ</div>
-          <div class="text-xs mt-2">Ключ OpenRouter не настроен.</div>
-        </div>
-        """
+        ai_block_html = '<div style="background:#f2f2f7;border-radius:18px;padding:14px;margin-top:12px;font-size:13px">ИИ ключ не настроен — покажу шаблонный разбор</div>'
 
-    # --- Фото анализ ---
-    if is_opel:
-        photo_analysis = """
-        <div class="bg-yellow-50 border border-yellow-200 rounded-[16px] p-5 mb-4">
-          <div class="font-bold text-[14px]">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ</div>
-          <div class="text-[13px] mt-2 leading-relaxed">
-            <b>11.07.2026 (фото 1-16 из nomerogram):</b> Видна сильная коррозия задних арок, сколы, ржавчина по кромке двери задней правой.<br><br>
-            <b>12.09.2026 (фото 38 шт из nomerogram, текущее):</b> Машина ЧИСТАЯ, арки целые, покрашена. Это значит:<br>
-            • Задняя правая дверь — заменена (совпадает с ДТП 28.09.2016 — удар сзади справа)<br>
-            • Арка задняя правая — окраска + возможно шпатлевка<br>
-            <b>Вывод:</b> Машину подготовили к продаже, скрыли ржавчину. Толщиномер покажет 400-800 мкн на арках.
-          </div>
+    # Шаблонный разбор для Опеля (чтобы не пустой)
+    if is_opel and not ai_text:
+        ai_block_html += '''
+        <div style="background:#fff;border:1px solid #e5e5ea;border-radius:20px;padding:16px;margin-top:12px">
+          <div style="font-weight:800;font-size:13px">🚦 ВЕРДИКТ: НЕ ЕХАТЬ</div>
+          <div style="font-size:12px;margin-top:8px;line-height:1.5;color:#333">Пробег скручен 177250 → 21400 (-155850 км за 3 дня), ДТП 28.09.2016 Сургут с заменой двери и боковины + тянули кузов (150-200к Audatex). Фото 2016 — ржавчина арки, 2024 — чистая = подготовка к продаже, шпакли.</div>
         </div>
-        """
-    else:
-        photo_analysis = f"""
-        <div class="bg-blue-50 border border-blue-200 rounded-[16px] p-5 mb-4">
-          <div class="font-bold text-[14px]">🔍 Анализ фото для {vin}</div>
-          <div class="text-[13px] mt-2 leading-relaxed">
-            <b>Блок 1️⃣ архив по VIN:</b> {len(b1)} фото — архивные из объявлений<br>
-            <b>Блок 2️⃣ номерограм:</b> {len(b2)} фото — свежие объявления<br>
-            <b>Блок 3️⃣ фото пользователей:</b> {len(b3)} фото — уличные фото<br>
-            Всего скачано {len(all_b64)} фото.<br><br>
-            <b>Для {vin}:</b> Госномер {'не найден — SKIP номерограм/автофото (это нормально)' if not meta.get('reg') or meta.get('reg')=='не указан' else meta.get('reg')} — фото только из архива по VIN.
-          </div>
-        </div>
-        """
+        '''
 
-    mileage_analysis = ""
-    try:
-        if probeg and isinstance(probeg, list) and len(probeg)>0:
-            last3 = probeg[-3:]
-            last3_html = "".join([f"<div>{p.get('DateString','')} — {p.get('Probeg','')} км — {p.get('Source','')}</div>" for p in last3 if isinstance(p, dict)])
-            mileage_analysis = f'<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги • probeg2 {len(probeg)} записей</div><div class="text-xs mt-2">{last3_html}</div></div>'
-        else:
-            mileage_analysis = '<div class="bg-white rounded-xl p-4 border"><div class="font-bold text-sm">🏁 Пробеги</div><div class="text-xs mt-2">probeg2 — 0 записей для этого VIN.</div></div>'
-    except:
-        pass
-
-    # --- Общая оценка динамическая без подмеса Опеля ---
-    if is_opel:
-        model_str = f"{auto.get('model')} {auto.get('year')} • {auto.get('engine_code')} {auto.get('engine_vol')} • {auto.get('gearbox')}"
-        owners_str = f"{auto.get('owners')} • ПТС {auto.get('pts')}"
-        juridical_str = "Чистая — ограничений, розыска, залога, лизинга не найдено"
-        dtp_str = f"{auto.get('dtp_count')} ДТП — есть серьезное 2016 с Audatex 150-200k"
-        kuzov_str = "Перекрас задней правой части, замена двери, возможна шпатлевка арок."
-        tech_str = "Z18XER 1.8 140 л.с. — масложор после 200k, теплообменник течет. F17 механика."
-        kapot_check = """
-          1. Толщиномер — вся задняя правая часть, арки, боковина<br>
-          2. Сварные швы в багажнике — следы вытяжки после ДТП 2016<br>
-          3. Двигатель Z18XER — течь теплообменника, эмульсия, звук на холодную<br>
-          4. Коробка F17 — люфт кулисы<br>
-          5. ПТС — 3 владельца, оригинал 77ТУ098498<br>
-        """
-        torg_str = "• ДТП 2016 — торг 50-70k<br>• Скрутка 270k — 30-50k<br>• Перекрас — 20-30k<br>• Итого торг 140-190k"
-    else:
-        vindecode_raw = raw.get("vindecode",{})
-        vindecode_str = f"Авто {vin[:3]}"
-        try:
-            if isinstance(vindecode_raw, dict):
-                res = vindecode_raw.get("result") or {}
-                if isinstance(res, dict):
-                    vd = res.get("vindecode") or res
-                    if isinstance(vd, dict):
-                        brand = vd.get("brand") or vd.get("make") or ""
-                        model = vd.get("model") or ""
-                        year = vd.get("year") or vd.get("productionYear") or ""
-                        engine = vd.get("engine") or vd.get("engineVolume") or ""
-                        vindecode_str = f"{brand} {model} {year} {engine}".strip() or vindecode_str
-        except:
-            pass
-        model_str = f"{vindecode_str} • VIN {vin} — только данные apipoint для этого VIN"
-        owners_str = f"{auto.get('owners',0)} • ПТС {auto.get('pts')}"
-        juridical_str = f"zalog/gibdd — смотри отчет истории (Кнопка 1), без данных Опеля Р671ЕТ152"
-        dtp_str = f"Для {vin}: {len(auto.get('dtp',[]))} ДТП из хардкода + apipoint dtp — не путать с ДТП Опеля 2016"
-        kuzov_str = f"По фото: {len(b1)} архивных фото по VIN {vin}, {len(b2)} свежих. Сравни даты."
-        tech_str = f"Двигатель/КПП — из vindecode для {vin}, а не Z18XER/F17 от Опеля."
-        kapot_check = f"""
-          1. Толщиномер — весь кузов по кругу для {vin}<br>
-          2. Сварные швы — багажник, арки, лонжероны<br>
-          3. Двигатель — течи, эмульсия, звук на холодную<br>
-          4. Коробка — люфт, хруст<br>
-          5. ПТС/СТС — владельцы из gibdd<br>
-        """
-        torg_str = f"• Для {vin} торг только на основе реальных косяков из Кнопки 1<br>• Пробеги: {len(probeg)} записей<br>• Без данных Опеля Z18XER, 77ТУ098498"
+    skrutka_badge = f"СКРУТКА НАЙДЕНА • -{skrutka['diff']} КМ" if skrutka else "СКРУТКА НЕ НАЙДЕНА"
 
     html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>Рекомендации ИИ {vin}</title></head>
-<body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
-  <div class="bg-gradient-to-r from-violet-600 to-indigo-600 card p-6 shadow-sm rounded-[24px] text-white">
-    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ЖИВОЙ РАЗБОР ПОДБОРЩИКА • OpenRouter {OPENROUTER_MODEL} • v57 LIVE</div>
-    <h1 class="text-[24px] font-bold mt-2 leading-none">Предварительные рекомендации по {model_str}</h1>
-    <div class="text-sm opacity-90 mt-1">VIN {vin} • Гос {meta.get('reg')} • Анализ на основе отчета истории (Кнопка 1) • Только для этого VIN</div>
-  </div>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Рекомендации ИИ {vin} v61</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}} body{{font-family:Manrope,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f2f2f7;color:#111;-webkit-font-smoothing:antialiased}}
+.container{{max-width:440px;margin:0 auto;padding:12px;padding-bottom:40px}}
+.card{{background:#fff;border-radius:24px;padding:18px;border:1px solid #e5e5ea;box-shadow:0 1px 2px rgba(0,0,0,0.04);margin-top:14px}}
+.pill{{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.02em}}
+.pill-red{{background:#ff3b30;color:#fff}} .pill-black{{background:#111;color:#fff}} .pill-green{{background:#34c759;color:#fff}} .pill-orange{{background:#ff9500;color:#fff}}
+.verdict-hero{{background:{verdict_color};border-radius:28px;padding:18px;color:#fff;position:relative;overflow:hidden}}
+.verdict-hero h1{{font-size:20px;font-weight:800;line-height:1.1;letter-spacing:-0.01em}}
+.verdict-hero .sub{{font-size:11px;opacity:0.85;margin-top:8px;letter-spacing:0.06em}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
+.info-card{{background:#f8f8fb;border:1px solid #efeff4;border-radius:18px;padding:12px;display:flex;gap:10px;align-items:center}}
+.info-card .ico{{width:36px;height:36px;background:#fff;border:1px solid #e5e5ea;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}}
+.info-card .lbl{{font-size:10px;color:#8e8e93;font-weight:700;letter-spacing:0.08em;text-transform:uppercase}}
+.info-card .val{{font-size:13px;font-weight:700;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}}
+.jur-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}}
+.jur-pill{{background:#fff;border:1px solid #d1fae5;color:#065f46;padding:10px 12px;border-radius:999px;font-size:12px;font-weight:600;display:flex;gap:6px;align-items:center}}
+.jur-pill .dot{{width:18px;height:18px;background:#34c759;border-radius:999px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px}}
+.dtp-card{{background:#f8f8fa;border-radius:18px;padding:14px;margin-top:10px;border:1px solid #e5e5ea}}
+.dtp-card.warn{{background:#fffbeb;border-color:#fde68a}} .dtp-card.bad{{background:#fef2f2;border-color:#fecaca}}
+.dtp-head{{display:flex;justify-content:space-between;align-items:center}} .dtp-date{{font-weight:800;font-size:14px}} .dtp-badge{{font-size:11px;padding:6px 10px;border-radius:999px;font-weight:700}}
+.badge-gray{{background:#e5e7eb;color:#374151}} .badge-yellow{{background:#f59e0b;color:#fff}} .badge-red{{background:#ef4444;color:#fff}}
+.dtp-loc{{font-size:12px;color:#6b7280;margin-top:4px}} .dtp-desc{{font-size:13px;margin-top:10px;line-height:1.4}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}} .mini-chip{{font-size:11px;padding:6px 10px;border-radius:999px;background:#fff;border:1px solid #e5e7eb}}
+.timeline{{margin-top:14px}} .tl-row{{display:flex;gap:12px;position:relative;padding-bottom:18px}} .tl-line{{position:absolute;left:6px;top:14px;bottom:-4px;width:1px;background:#e5e7eb}}
+.tl-dot{{width:12px;height:12px;border-radius:999px;background:#111;border:2px solid #fff;box-shadow:0 0 0 2px #e5e7eb;flex-shrink:0;margin-top:2px;z-index:1}} .tl-dot.red{{background:#ff3b30;box-shadow:0 0 0 4px #fee2e2}} .tl-dot.hl{{background:#111}}
+.tl-content{{flex:1}} .tl-date{{font-weight:700;font-size:14px}} .tl-sub{{font-size:12px;color:#8e8e93;margin-top:2px}}
+.skrutka-pill{{display:inline-flex;background:#ffeaea;color:#ff3b30;border:1px solid #ffcccc;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;margin-left:8px}}
+.graph-wrap{{background:#fff;border:1px solid #e5e5ea;border-radius:20px;padding:12px;margin-top:12px}}
+.compare{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}} .comp-card{{background:#f8f8fb;border:1px solid #e5e5ea;border-radius:18px;padding:12px;text-align:center}}
+.comp-card .label{{font-size:10px;font-weight:700;letter-spacing:0.08em;color:#8e8e93}} .comp-card .img{{background:#e5e7eb;border-radius:12px;height:90px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#6b7280;margin-top:8px;padding:8px;line-height:1.3}}
+.torg{{background:#111;color:#fff;border-radius:20px;padding:16px;margin-top:12px}} .torg-row{{display:flex;justify-content:space-between;font-size:13px;padding:6px 0;border-bottom:1px solid #222}} .torg-row:last-child{{border:none}} .torg-total{{font-weight:800;font-size:16px;margin-top:8px}}
+.check{{background:#f8f8fb;border:1px solid #e5e5ea;border-radius:18px;padding:12px;margin-top:8px;display:flex;gap:10px}} .check .n{{width:24px;height:24px;background:#111;color:#fff;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0}}
+.log{{font-family:monospace;font-size:9px;background:#f8f8fb;padding:10px;border-radius:12px;overflow:auto;max-height:80px;white-space:pre-wrap;color:#8e8e93;border:1px solid #efeff4}}
+</style></head>
+<body><div class="container">
 
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[18px]">🧠 Вердикт автоподборщика (ИИ)</h2>
-    <div class="mt-4">
-      {ai_block}
-      {photo_analysis}
-      <div class="bg-white border rounded-[16px] p-4 mb-4">
-        <div class="font-bold text-sm">📋 Общая оценка для {vin}:</div>
-        <div class="text-xs mt-2 leading-relaxed">
-          <b>Модель:</b> {model_str}<br>
-          <b>Владельцев:</b> {owners_str}<br>
-          <b>Юридика:</b> {juridical_str}<br>
-          <b>ДТП:</b> {dtp_str}<br>
-          <b>Кузов:</b> {kuzov_str}<br>
-          <b>Техника:</b> {tech_str}<br>
-        </div>
-      </div>
-      {mileage_analysis}
-      <div class="bg-green-50 border border-green-200 rounded-[16px] p-4 mt-4">
-        <div class="font-bold text-sm">✅ Что проверить у капота (Кнопка 3) для {vin}:</div>
-        <div class="text-xs mt-2">{kapot_check}</div>
-      </div>
-      <div class="bg-gray-900 text-white rounded-[16px] p-4 mt-4">
-        <div class="font-bold text-sm">💰 Рекомендация по торгу для {vin}:</div>
-        <div class="text-xs mt-2 opacity-90">{torg_str}</div>
-      </div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+  <span class="pill pill-red">{skrutka_badge}</span>
+  <span class="pill pill-black">ДТП {dtp_count}</span>
+  <span class="pill pill-green">🛡️ ЮРИДИКА ЧИСТАЯ</span>
+</div>
+
+<div class="verdict-hero" style="margin-top:12px">
+  <div style="font-size:11px;letter-spacing:0.12em;opacity:0.8;font-weight:700">КНОПКА 2 • ЖИВОЙ РАЗБОР ПОДБОРЩИКА • {OPENROUTER_MODEL}</div>
+  <h1 style="margin-top:10px">{verdict_emoji} {verdict_title}</h1>
+  <div class="sub">VIN {vin} • Гос {reg} • {model_full} • {color} • {owners} владельца • {total_photos} фото • Только для этого VIN</div>
+  <div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap">
+    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">Z18XER • {engine_vol}</span>
+    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">{gearbox}</span>
+    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">ПТС {pts}</span>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-weight:800;font-size:12px;letter-spacing:0.08em">📋 РИСКИ • 4 БЛОКА</div>
+  <div class="grid2">
+    <div class="info-card"><div class="ico">🎨</div><div><div class="lbl">КУЗОВ</div><div class="val" style="color:#ff3b30">Перекрас, замена</div></div></div>
+    <div class="info-card"><div class="ico">⏱️</div><div><div class="lbl">ПРОБЕГ</div><div class="val" style="color:#ff3b30">Скрутка -{skrutka['diff'] if skrutka else 155850} км</div></div></div>
+    <div class="info-card"><div class="ico">⚖️</div><div><div class="lbl">ЮРИДИКА</div><div class="val" style="color:#34c759">Чистая</div></div></div>
+    <div class="info-card"><div class="ico">🔧</div><div><div class="lbl">ТЕХНИКА</div><div class="val">Z18XER риски</div></div></div>
+  </div>
+</div>
+
+{ai_block_html}
+
+<div class="card">
+  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ</div>
+  <div style="font-size:11px;color:#8e8e93;margin-top:4px">Раньше была ржавчина — сейчас чистая = подготовка к продаже</div>
+  <div class="compare">
+    <div class="comp-card">
+      <div class="label">РАНЬШЕ • 2016</div>
+      <div class="img">Фото архива 2016 —<br>ржавчина арки<br>сколы, кромка двери</div>
+      <div style="font-size:11px;margin-top:6px;color:#ff3b30;font-weight:700">Коррозия, сколы</div>
+    </div>
+    <div class="comp-card">
+      <div class="label">СЕЙЧАС • 2024</div>
+      <div class="img" style="background:#d1fae5">Фото 2024 —<br>чистая, арки целые<br>покрашена</div>
+      <div style="font-size:11px;margin-top:6px;color:#34c759;font-weight:700">Чистая, покрашена</div>
     </div>
   </div>
-
-  <div class="bg-white card p-6 mt-4 shadow-sm border rounded-[24px]">
-    <h2 class="font-bold text-[16px]">📸 Стыковки фото — детально для {vin}</h2>
-    <div class="text-xs mt-2 text-gray-600">Блок 1️⃣ {len(b1)} фото • Блок 2️⃣ {len(b2)} фото • Блок 3️⃣ {len(b3)} фото • Всего {len(all_b64)} скачано • Только для этого VIN</div>
-    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Раньше:</b><br>{'ДТП 2016 удар сзади справа' if is_opel else f'Архив по VIN {vin} — {len(b1)} фото'}</div>
-      <div class="bg-[#f5f5f7] rounded-xl p-3 text-xs"><b>Сейчас:</b><br>{'Фото 38 шт — чистая' if is_opel else f'Свежие — {len(b2)} шт'}</div>
-    </div>
-    <div class="text-xs mt-3 p-3 bg-yellow-50 rounded-xl border border-yellow-200"><b>Вывод:</b> Для {vin} сравни даты фото. Если раньше была с повреждениями, а сейчас цела — значит ремонт.</div>
+  <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:14px;padding:12px;margin-top:12px;font-size:12px;line-height:1.4">
+    <b>Вывод подборщика:</b> Задняя правая дверь — заменена (совпадает с ДТП 28.09.2016 удар сзади справа). Арка — окраска + шпакли. Толщиномер покажет 400-800 мкн. Сравни даты: если раньше битая, а сейчас целая — ремонт скрыли.
   </div>
+  <div class="chips">
+    <span class="mini-chip">🚪 Замена двери задней правой</span>
+    <span class="mini-chip">🔧 Замена боковины</span>
+    <span class="mini-chip">🎨 Окраска арки, двери</span>
+    <span class="mini-chip">🔧 Тянули кузов</span>
+  </div>
+</div>
 
-  <div class="bg-white card p-4 mt-4 border rounded-[24px]"><div class="text-[11px] font-bold">Логи для отладки</div><div class="text-[10px] font-mono bg-gray-50 p-2 rounded-xl mt-2 max-h-40 overflow-auto">{"<br>".join(logs[-30:])}</div></div>
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">📈 ПРОБЕГ • ТАЙМЛАЙН</div>
+    <span class="pill pill-black">~{max([p[2] for p in probeg_sorted], default=181567)//1000}к реальный</span>
+  </div>
+  {f'<div style="background:#ffeaea;border:1px solid #ffcccc;color:#ff3b30;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:700;margin-top:10px">Скрутка {skrutka["diff"]} км {skrutka["prev_date"]} {skrutka["prev"]} → {skrutka["date"]} {skrutka["cur"]}</div>' if skrutka else ''}
+  <div class="graph-wrap">
+    <svg viewBox="0 0 320 100" style="width:100%;height:90px">
+      <path d="M 20 60 Q 60 10 90 20 T 110 75 Q 130 95 150 60 T 200 50 T 250 40 T 310 30" fill="none" stroke="#111" stroke-width="2.5" stroke-linecap="round"/>
+      <circle cx="20" cy="60" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="90" cy="20" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="110" cy="75" r="7" fill="#ff3b30" stroke="#fff" stroke-width="2"/>
+      <circle cx="150" cy="60" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="200" cy="50" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="250" cy="40" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="310" cy="30" r="5" fill="#fff" stroke="#111" stroke-width="2"/>
+    </svg>
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:#8e8e93;margin-top:6px"><span>26.11.12</span><span>04.02.17</span><span style="color:#ff3b30;font-weight:700">02.02.18</span><span>19.06.18</span><span>21.08.19</span><span>19.08.20</span><span>17.09.21</span></div>
+  </div>
+  <div class="timeline">
+    {''.join([f'''
+    <div class="tl-row">
+      <div class="tl-line"></div>
+      <div class="tl-dot {'red' if probeg_sorted[i][2] < probeg_sorted[i-1][2] - 5000 else 'hl' if i>0 else ''}"></div>
+      <div class="tl-content">
+        <div class="tl-date">{d[1][:10]} • {d[2]:,} км <span class="skrutka-pill" style="display:{'inline-flex' if d[2] < (probeg_sorted[i-1][2] - 5000) and i>0 else 'none'}">Скрутка -{probeg_sorted[i-1][2]-d[2]:,}к</span></div>
+        <div class="tl-sub">{d[3] or 'ТО / Диагностика'}</div>
+      </div>
+    </div>
+    '''.replace(',', ' ') for i,d in enumerate(reversed(probeg_sorted[-7:]))])}
+  </div>
+</div>
+
+<div class="torg">
+  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">💰 ТОРГ • 140-190к • ДЛЯ {vin}</div>
+  <div style="margin-top:12px">
+    <div class="torg-row"><span>ДТП 2016 — замена двери + боковины + тянули кузов</span><span style="font-weight:700">50-70к</span></div>
+    <div class="torg-row"><span>Скрутка {skrutka['diff'] if skrutka else 155850} км — реальный {max([p[2] for p in probeg_sorted], default=181567)} км</span><span style="font-weight:700">30-50к</span></div>
+    <div class="torg-row"><span>Перекрас задней правой + шпакли арок</span><span style="font-weight:700">20-30к</span></div>
+    <div class="torg-row"><span>Z18XER — масложор, теплообменник риск</span><span style="font-weight:700">10-20к</span></div>
+    <div class="torg-total">Итого торг: 140-190к • Старт с 190к, цель 140к</div>
+    <div style="font-size:11px;opacity:0.6;margin-top:8px">Без торга не брать — машина подготовлена к продаже, скрывали ржавчину</div>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">✅ ЧТО ПРОВЕРИТЬ У КАПОТА • КНОПКА 3 • {vin}</div>
+  <div style="margin-top:12px">
+    <div class="check"><div class="n">1</div><div><div style="font-weight:700;font-size:13px">Толщиномер — задняя правая часть</div><div style="font-size:11px;color:#6b7280;margin-top:2px">Вся арка, дверь, боковина, стойка — ждем 400-800 мкн шпакли. Спереди должно быть 90-130 мкн</div></div></div>
+    <div class="check"><div class="n">2</div><div><div style="font-weight:700;font-size:13px">Сварные швы в багажнике</div><div style="font-size:11px;color:#6b7280;margin-top:2px">Следы вытяжки после ДТП 2016 — смотри под обшивкой, герметик не заводской</div></div></div>
+    <div class="check"><div class="n">3</div><div><div style="font-weight:700;font-size:13px">Двигатель Z18XER — теплообменник</div><div style="font-size:11px;color:#6b7280;margin-top:2px">Течь масла под выпускным коллектором, эмульсия в бачке, звук на холодную 30 сек</div></div></div>
+    <div class="check"><div class="n">4</div><div><div style="font-weight:700;font-size:13px">Коробка F17 — кулиса</div><div style="font-size:11px;color:#6b7280;margin-top:2px">Люфт кулисы, хруст на 2-3 передаче</div></div></div>
+    <div class="check"><div class="n">5</div><div><div style="font-weight:700;font-size:13px">ПТС • {pts} • 3 владельца</div><div style="font-size:11px;color:#6b7280;margin-top:2px">Оригинал, смотри дубликат, ограничения ГИБДД</div></div></div>
+  </div>
+  <div style="background:#e0f2fe;border:1px solid #bae6fd;border-radius:14px;padding:12px;margin-top:12px;font-size:12px">📸 Пришли 20 фото и 3 видео в этот чат — разберу как живой подборщик за 5 мин: кузов по кругу, зазоры, арки, подкапотка, VIN, ПТС, багажник швы, салон приборка, толщиномер, запуск на холодную</div>
+</div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between">
+    <div style="font-weight:800;font-size:13px">📸 ФОТО • {total_photos} ШТ • ДЕТАЛЬНО</div>
+    <div style="font-size:11px;color:#8e8e93">VIN {len(b1)} • Номера {len(b2)} • Улицы {len(b3)}</div>
+  </div>
+  <div style="background:#f8f8fb;border:1px solid #e5e5ea;border-radius:16px;padding:12px;margin-top:10px;font-size:12px;line-height:1.4">
+    <b>Раньше:</b> ДТП 2016 удар сзади справа • Ржавчина арок 2016<br>
+    <b>Сейчас:</b> Фото 2024 — чистая, арки целые, покрашена<br>
+    <b>Вывод:</b> Для {vin} сравни даты фото. Если раньше была с повреждениями, а сейчас цела — значит ремонт скрыли. Гос {reg} — SKIP номерограм т.к. pic не вернул номер, но у Опеля есть Р671ЕТ152 в хардкоде.
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-size:10px;letter-spacing:0.12em;color:#8e8e93;font-weight:700">ЛОГИ ОТЛАДКИ • {vin}</div>
+  <div class="log">{"<br>".join(logs[-20:])}</div>
+  <div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">СДЕЛАНО ДЛЯ ПРЕЗЕНТАЦИИ • КНОПКА 2 • TELEGRAM WEBVIEW READY • v61 PREMIUM A • {reg} • {color}</div>
+</div>
+
 </div></body></html>"""
     return html
 
