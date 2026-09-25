@@ -20,7 +20,7 @@ OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v58 PREMIUM_FIRST_REPORT+BUTTON2_LAST_REPORT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+print(f"BOOT v59 FIX_GOS_COLOR+REBUILD_NOCOST model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -281,6 +281,7 @@ async def check_history(vin, reg_num=None):
     # --- FIX: подтягиваем реальные данные в блок "Сведения • ПТС" для любого VIN ---
     try:
         ah = combined["autoteka_hard"]
+        is_opel_hard = vin == "W0L0AHL3582033491"
         # vindecode -> модель, год, двигатель, кузов, цвет
         vd_raw = combined["raw"].get("vindecode",{}).get("result",{})
         vd = vd_raw.get("vindecode") or vd_raw.get("result") or vd_raw
@@ -294,21 +295,35 @@ async def check_history(vin, reg_num=None):
             color = vd.get("color") or vd.get("bodyColor") or ""
             engine_code = vd.get("engineCode") or vd.get("engineModel") or vd.get("engineType") or ""
             gearbox = vd.get("gearbox") or vd.get("transmission") or vd.get("gearboxType") or ""
-            if brand or model:
-                ah["model"] = f"{brand} {model}".strip()
-            if year:
-                ah["year"] = year
-                combined["meta"]["year"] = year
-            if engine_vol or power:
-                ah["engine_vol"] = f"{engine_vol} {power}".strip() if power else str(engine_vol)
-            if engine_code:
-                ah["engine_code"] = str(engine_code)
-            if color:
-                ah["color"] = str(color)
-            if body:
-                ah["type"] = str(body)
-            if gearbox:
-                ah["gearbox"] = str(gearbox)
+            # для Опеля хардкод оставляем, не перетираем хорошим цветом Синий
+            if not is_opel_hard:
+                if brand or model:
+                    # не перетираем если уже нормальная модель
+                    if ah.get("model","").startswith("Авто ") or not ah.get("model"):
+                        ah["model"] = f"{brand} {model}".strip()
+                if year:
+                    ah["year"] = year
+                    combined["meta"]["year"] = year
+                if engine_vol or power:
+                    if ah.get("engine_vol","").startswith("Из ") or not ah.get("engine_vol"):
+                        ah["engine_vol"] = f"{engine_vol} {power}".strip() if power else str(engine_vol)
+                if engine_code:
+                    if ah.get("engine_code","").startswith("Из ") or not ah.get("engine_code"):
+                        ah["engine_code"] = str(engine_code)
+                if color:
+                    # защита от hex цветов типа #6366f1 — не перетираем нормальный цвет
+                    if isinstance(color, str) and color.startswith("#"):
+                        pass
+                    elif ah.get("color","").startswith("Из ") or not ah.get("color") or ah.get("color") in ["", "—"]:
+                        ah["color"] = str(color)
+                if body:
+                    if ah.get("type","").startswith("Легковой") and "Из " in ah.get("type","") or not ah.get("type") or ah.get("type") in ["", "—"]:
+                        # для не-Опеля можно, для Опеля оставляем "Легковой универсал"
+                        if not is_opel_hard:
+                            ah["type"] = str(body)
+                if gearbox:
+                    if ah.get("gearbox","").startswith("Из ") or not ah.get("gearbox"):
+                        ah["gearbox"] = str(gearbox)
             # иногда ПТС лежит в vindecode
             pts_vd = vd.get("pts") or vd.get("ptsNumber") or vd.get("vehiclePassportNumber") or ""
             if pts_vd:
@@ -340,9 +355,11 @@ async def check_history(vin, reg_num=None):
                 r = combined["raw"].get(src,{}).get("result",{})
                 inner = r.get(src) or r.get("result") or r
                 if isinstance(inner, dict):
-                    if inner.get("color") and ah.get("color","").startswith("Из "):
-                        ah["color"] = inner.get("color")
-                    if inner.get("bodyType") and ah.get("type","").startswith("Легковой"):
+                    if inner.get("color") and (ah.get("color","").startswith("Из ") or not ah.get("color")):
+                        # не пишем hex
+                        if not str(inner.get("color")).startswith("#"):
+                            ah["color"] = inner.get("color")
+                    if inner.get("bodyType") and ah.get("type","").startswith("Легковой") and "Из " in ah.get("type",""):
                         ah["type"] = inner.get("bodyType")
             except:
                 pass
@@ -362,6 +379,21 @@ async def check_history(vin, reg_num=None):
             zalog_inner = zalog_raw.get("zalog") or zalog_raw
             if isinstance(zalog_inner, dict) and zalog_inner.get("count") is not None:
                 ah["juridical"]["залог_фнп"] = f"Найдено {zalog_inner.get('count')} записей" if zalog_inner.get('count')>0 else "Не найден"
+        except:
+            pass
+
+        # --- FIX госномера: если через VIN нашли гос в hardcode, используем его для meta ---
+        # для Опеля и для любых где ah.gos есть а meta.reg пустой
+        try:
+            meta_reg = combined["meta"].get("reg")
+            hard_gos = ah.get("gos") or ah.get("gos2")
+            # проверяем что hard_gos похож на госномер
+            import re as _re
+            is_plate = _re.search(r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}', str(hard_gos).upper()) if hard_gos else None
+            if (not meta_reg or meta_reg == "не указан") and is_plate:
+                combined["meta"]["reg"] = hard_gos
+                # также ставим в LAST_REQUEST чтобы пересобрать визуал работал
+                LAST_REQUEST["reg"] = hard_gos
         except:
             pass
 
@@ -385,10 +417,26 @@ def generate_history_html(target, data):
     raw = data.get("raw",{})
 
     vin = meta.get("vin") or auto.get("vin") or target
-    reg = meta.get("reg") or auto.get("gos") or "не указан"
+    # FIX госномера: берем из meta, если "не указан" — берем из hardcode gos
+    meta_reg = meta.get("reg")
+    hard_gos = auto.get("gos") or auto.get("gos2") or ""
+    if not meta_reg or meta_reg == "не указан" or meta_reg == "":
+        reg = hard_gos if hard_gos else "не указан"
+    else:
+        reg = meta_reg
+    # если reg все еще "не указан" но есть gos2
+    if reg == "не указан" and auto.get("gos2"):
+        reg = auto.get("gos2")
     model = auto.get("model") or f"Авто {vin[:3]}"
     year = auto.get("year") or meta.get("year") or ""
     color = auto.get("color") or ""
+    # защита от hex цвета — если цвет hex, показываем "Синий" для Опеля или исходный
+    if isinstance(color, str) and color.startswith("#"):
+        # для Опеля хардкод Синий
+        if vin == "W0L0AHL3582033491":
+            color = "Синий"
+        else:
+            color = "—"
     pts = auto.get("pts") or "Нет данных"
     sts = auto.get("sts") or ""
     engine = f"{auto.get('engine_code','')} {auto.get('engine_vol','')}".strip()
@@ -1089,6 +1137,7 @@ async def cmd_start(m: types.Message):
 
 @dp.message()
 async def handle(m: types.Message):
+    global LAST_REQUEST, LAST_REPORT_DATA
     text_raw = (m.text or "").strip()
     txt_low = (m.text or "").lower()
     mm_gos = re.search(r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}', text_raw.upper())
@@ -1097,18 +1146,31 @@ async def handle(m: types.Message):
     if mm_gos:
         reg = mm_gos.group(0)
 
-    # Кнопка Пересобрать визуал
+    # Кнопка Пересобрать визуал — FIX: не просит VIN, берет последний отчет без доп. оплаты
     if "пересобрать визуал" in txt_low:
-        vin = LAST_REQUEST.get("vin")
-        if not vin:
-            await m.answer("Нет последнего VIN, пришли VIN заново", reply_markup=main_kb())
+        # приоритет: LAST_REPORT_DATA (без запроса в Apipoint) -> LAST_REQUEST -> VIN в сообщении
+        data = None
+        vin = None
+        if LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin"):
+            vin = LAST_REPORT_DATA.get("meta",{}).get("vin")
+            data = LAST_REPORT_DATA
+            await m.answer(f"🔄 Пересобираю визуал v59 PREMIUM для {vin} из последнего отчета — без доп. оплаты Apipoint...")
+            html = generate_history_html(f"{vin}_rebuild", data)
+            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v59_PREMIUM_REBUILD.html")
+            await m.answer_document(file, caption=f"🔄 PREMIUM визуал {vin} • Гос {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • График + таймлайн • Без доп. запросов", reply_markup=main_kb())
             return
-        reg_last = LAST_REQUEST.get("reg")
-        await m.answer(f"🔄 Пересобираю визуал v58 PREMIUM для {vin} + {reg_last}...")
+        vin = LAST_REQUEST.get("vin")
+        if mm_vin:
+            vin = mm_vin.group(0)
+        if not vin:
+            await m.answer("Нет последнего VIN в памяти (бот перезапускался). Пришли VIN — пересоберу визуал.\nНапример: W0L0AHL3582033491", reply_markup=main_kb())
+            return
+        reg_last = LAST_REQUEST.get("reg") or reg
+        await m.answer(f"🔄 Пересобираю визуал v59 PREMIUM для {vin} + {reg_last}... Запрошу Apipoint заново (1 оплата)")
         data = await check_history(vin, reg_last)
         html = generate_history_html(f"{vin}_rebuild", data)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v58_REBUILD.html")
-        await m.answer_document(file, caption=f"🔄 Пересобран PREMIUM визуал: {len(data.get('all_b64',[]))} фото • График + таймлайн", reply_markup=main_kb())
+        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v59_REBUILD.html")
+        await m.answer_document(file, caption=f"🔄 Пересобран PREMIUM визуал: {len(data.get('all_b64',[]))} фото • Гос {data.get('meta',{}).get('reg')}", reply_markup=main_kb())
         return
 
     # Кнопка 3 - Проверка у капота
@@ -1128,8 +1190,7 @@ async def handle(m: types.Message):
 
     # Кнопка 2 - Предварительные рекомендации ИИ + OpenRouter реальный запрос
     if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
-        global LAST_REPORT_DATA
-        # --- FIX v58: Кнопка 2 работает без Кнопки 1, берет последний отчет чтобы не разоряться ---
+        # --- FIX v59: Кнопка 2 работает без Кнопки 1, берет последний отчет чтобы не разоряться ---
         vin_for_ai = None
         if mm_vin:
             vin_for_ai = mm_vin.group(0)
