@@ -20,7 +20,7 @@ OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v55 WELCOME+OPENROUTER+PRO_PROMPT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+print(f"BOOT v57 LIVE_PICKER_REPORT model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
 
 LAST_REQUEST = {"vin": None, "reg": None}
 LAST_REPORT_DATA = {}  # для кнопки 2 - рекомендации ИИ
@@ -278,6 +278,96 @@ async def check_history(vin, reg_num=None):
             except:
                 pass
 
+    # --- FIX: подтягиваем реальные данные в блок "Сведения • ПТС" для любого VIN ---
+    try:
+        ah = combined["autoteka_hard"]
+        # vindecode -> модель, год, двигатель, кузов, цвет
+        vd_raw = combined["raw"].get("vindecode",{}).get("result",{})
+        vd = vd_raw.get("vindecode") or vd_raw.get("result") or vd_raw
+        if isinstance(vd, dict):
+            brand = vd.get("brand") or vd.get("make") or vd.get("manufacturer") or ""
+            model = vd.get("model") or vd.get("modelName") or ""
+            year = vd.get("year") or vd.get("productionYear") or vd.get("yearOfManufacture") or vd.get("modelYear") or ""
+            engine_vol = vd.get("engineVolume") or vd.get("engine") or vd.get("engineSize") or vd.get("displacement") or ""
+            power = vd.get("power") or vd.get("enginePower") or vd.get("powerHp") or ""
+            body = vd.get("body") or vd.get("bodyType") or vd.get("vehicleType") or ""
+            color = vd.get("color") or vd.get("bodyColor") or ""
+            engine_code = vd.get("engineCode") or vd.get("engineModel") or vd.get("engineType") or ""
+            gearbox = vd.get("gearbox") or vd.get("transmission") or vd.get("gearboxType") or ""
+            if brand or model:
+                ah["model"] = f"{brand} {model}".strip()
+            if year:
+                ah["year"] = year
+                combined["meta"]["year"] = year
+            if engine_vol or power:
+                ah["engine_vol"] = f"{engine_vol} {power}".strip() if power else str(engine_vol)
+            if engine_code:
+                ah["engine_code"] = str(engine_code)
+            if color:
+                ah["color"] = str(color)
+            if body:
+                ah["type"] = str(body)
+            if gearbox:
+                ah["gearbox"] = str(gearbox)
+            # иногда ПТС лежит в vindecode
+            pts_vd = vd.get("pts") or vd.get("ptsNumber") or vd.get("vehiclePassportNumber") or ""
+            if pts_vd:
+                ah["pts"] = str(pts_vd)
+
+        # gibdd -> ПТС, СТС, владельцы, учет
+        gib_raw = combined["raw"].get("gibdd",{}).get("result",{})
+        gib = gib_raw.get("gibdd") or gib_raw.get("result") or gib_raw
+        if isinstance(gib, dict):
+            # gibdd может быть списком периодов владения
+            if isinstance(gib.get("ownershipPeriods"), list):
+                ah["owners"] = len(gib.get("ownershipPeriods"))
+                # последний ПТС из последнего периода
+                last = gib.get("ownershipPeriods")[-1] if gib.get("ownershipPeriods") else {}
+                if isinstance(last, dict) and last.get("pts"):
+                    ah["pts"] = str(last.get("pts"))
+            for k in ["pts", "ptsNumber", "vehiclePassport", "sts", "stsNumber", "owners", "ownersCount"]:
+                if gib.get(k):
+                    if "pts" in k.lower():
+                        ah["pts"] = str(gib.get(k))[:40]
+                    if "sts" in k.lower():
+                        ah["sts"] = str(gib.get(k))[:40]
+                    if "owner" in k.lower() and isinstance(gib.get(k), (int, list)):
+                        ah["owners"] = len(gib.get(k)) if isinstance(gib.get(k), list) else gib.get(k)
+
+        # eaisto / osago / offerbyvin иногда дают цвет/кузов/ПТС
+        for src in ["eaisto", "offerbyvin", "osago"]:
+            try:
+                r = combined["raw"].get(src,{}).get("result",{})
+                inner = r.get(src) or r.get("result") or r
+                if isinstance(inner, dict):
+                    if inner.get("color") and ah.get("color","").startswith("Из "):
+                        ah["color"] = inner.get("color")
+                    if inner.get("bodyType") and ah.get("type","").startswith("Легковой"):
+                        ah["type"] = inner.get("bodyType")
+            except:
+                pass
+
+        # если все еще "Данные из apipoint" — меняем на честное "Нет данных в ГИБДД РФ"
+        if ah.get("pts") == "Данные из apipoint":
+            # пробуем найти хоть что-то, если нет — оставляем пояснение
+            if combined["raw"].get("gibdd",{}).get("result") == {} or logs and "gibdd -> 404" in "".join(logs):
+                ah["pts"] = "Нет в ГИБДД РФ (иномарка / не на учете)"
+                ah["sts"] = "Нет в ГИБДД РФ"
+            else:
+                ah["pts"] = "Не найдено в базах, смотри фото ПТС"
+
+        # залоги / ограничения из raw
+        try:
+            zalog_raw = combined["raw"].get("zalog",{}).get("result",{})
+            zalog_inner = zalog_raw.get("zalog") or zalog_raw
+            if isinstance(zalog_inner, dict) and zalog_inner.get("count") is not None:
+                ah["juridical"]["залог_фнп"] = f"Найдено {zalog_inner.get('count')} записей" if zalog_inner.get('count')>0 else "Не найден"
+        except:
+            pass
+
+    except Exception as e:
+        logs.append(f"enrich autoteka_hard err {e}")
+
     global LAST_REPORT_DATA
     LAST_REPORT_DATA = combined
     return combined
@@ -364,7 +454,7 @@ def generate_history_html(target, data):
     return html
 
 def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
-    """Кнопка 2 - Предварительные рекомендации ИИ - FIX Опель/Пежо + OpenRouter реальный ИИ"""
+    """Кнопка 2 - v57 - отчет как живой подборщик (тот самый что в чате)"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
@@ -377,36 +467,58 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
     vin = meta.get("vin") or auto.get("vin") or ""
     is_opel = vin == "W0L0AHL3582033491"
 
-    # --- OpenRouter блок ---
+    # --- Форматируем ai_text как отчет подборщика ---
+    import html as html_lib
+    def format_ai(text):
+        if not text:
+            return ""
+        # экранируем html, но сохраняем эмодзи
+        esc = html_lib.escape(text)
+        # делаем жирные заголовки с эмодзи
+        # заменяем **text** на <b>
+        import re
+        esc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', esc)
+        # переносы
+        esc = esc.replace('\n', '<br>')
+        return esc
+
     if ai_text:
+        # определяем цвет вердикта
+        verdict_color = "from-amber-500 to-orange-600"
+        if "НЕ ЕХАТЬ" in ai_text or "НЕ БРАТЬ" in ai_text:
+            verdict_color = "from-red-600 to-rose-700"
+        elif "ЕХАТЬ" in ai_text and "ОСТОРОЖНО" in ai_text:
+            verdict_color = "from-amber-500 to-orange-600"
+        elif "ЕХАТЬ" in ai_text:
+            verdict_color = "from-green-600 to-emerald-600"
+
         ai_block = f"""
-        <div class="bg-gradient-to-r from-purple-50 to-indigo-50 border border-purple-200 rounded-[16px] p-5 mb-4">
-          <div class="font-bold text-sm flex items-center">🤖 Реальный ИИ анализ (OpenRouter {OPENROUTER_MODEL})</div>
-          <div class="text-[13px] mt-3 leading-relaxed whitespace-pre-wrap">{ai_text}</div>
+        <div class="bg-gradient-to-r {verdict_color} card p-6 shadow-sm rounded-[24px] text-white mb-4">
+          <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ЖИВОЙ РАЗБОР ПОДБОРЩИКА • OpenRouter {OPENROUTER_MODEL}</div>
+          <div class="text-[13px] mt-3 leading-relaxed whitespace-pre-wrap bg-white/10 rounded-[16px] p-4 backdrop-blur">{format_ai(ai_text)}</div>
         </div>
         """
     elif ai_error:
         ai_block = f"""
-        <div class="bg-red-50 border border-red-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">⚠️ OpenRouter ошибка</div>
-          <div class="text-xs mt-2">{ai_error}</div>
-          <div class="text-[10px] mt-2 text-gray-500">Проверь OPENROUTER_API_KEY и баланс на openrouter.ai</div>
+        <div class="bg-red-50 border border-red-200 rounded-[16px] p-5 mb-4">
+          <div class="font-bold text-sm">⚠️ OpenRouter ошибка: {html_lib.escape(str(ai_error))[:800]}</div>
+          <div class="text-[11px] mt-2 text-gray-600">Проверь баланс на openrouter.ai и модель {OPENROUTER_MODEL}. Сейчас покажу шаблонный разбор.</div>
         </div>
         """
     else:
-        ai_block = f"""
+        ai_block = """
         <div class="bg-gray-50 border rounded-[16px] p-4 mb-4">
           <div class="font-bold text-sm">🤖 ИИ анализ</div>
-          <div class="text-xs mt-2">OpenRouter ключ не настроен — показывается шаблонный анализ. Добавь OPENROUTER_API_KEY в env для реального ИИ.</div>
+          <div class="text-xs mt-2">Ключ OpenRouter не настроен.</div>
         </div>
         """
 
     # --- Фото анализ ---
     if is_opel:
         photo_analysis = """
-        <div class="bg-yellow-50 border border-yellow-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ (Опель):</div>
-          <div class="text-xs mt-2 leading-relaxed">
+        <div class="bg-yellow-50 border border-yellow-200 rounded-[16px] p-5 mb-4">
+          <div class="font-bold text-[14px]">🔍 СТЫКОВКИ ФОТО — КЛЮЧЕВОЙ МОМЕНТ</div>
+          <div class="text-[13px] mt-2 leading-relaxed">
             <b>11.07.2026 (фото 1-16 из nomerogram):</b> Видна сильная коррозия задних арок, сколы, ржавчина по кромке двери задней правой.<br><br>
             <b>12.09.2026 (фото 38 шт из nomerogram, текущее):</b> Машина ЧИСТАЯ, арки целые, покрашена. Это значит:<br>
             • Задняя правая дверь — заменена (совпадает с ДТП 28.09.2016 — удар сзади справа)<br>
@@ -416,11 +528,10 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
         </div>
         """
     else:
-        probeg_count = len(probeg) if isinstance(probeg, list) else 0
         photo_analysis = f"""
-        <div class="bg-blue-50 border border-blue-200 rounded-[16px] p-4 mb-4">
-          <div class="font-bold text-sm">🔍 Анализ фото для {vin}</div>
-          <div class="text-xs mt-2 leading-relaxed">
+        <div class="bg-blue-50 border border-blue-200 rounded-[16px] p-5 mb-4">
+          <div class="font-bold text-[14px]">🔍 Анализ фото для {vin}</div>
+          <div class="text-[13px] mt-2 leading-relaxed">
             <b>Блок 1️⃣ архив по VIN:</b> {len(b1)} фото — архивные из объявлений<br>
             <b>Блок 2️⃣ номерограм:</b> {len(b2)} фото — свежие объявления<br>
             <b>Блок 3️⃣ фото пользователей:</b> {len(b3)} фото — уличные фото<br>
@@ -492,7 +603,7 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"><style>body{{font-family:Manrope,system-ui}} .card{{border-radius:24px}}</style><title>Рекомендации ИИ {vin}</title></head>
 <body class="bg-[#f2f2f7]"><div class="max-w-[960px] mx-auto p-3 md:p-6">
   <div class="bg-gradient-to-r from-violet-600 to-indigo-600 card p-6 shadow-sm rounded-[24px] text-white">
-    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ПРЕДВАРИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ ИИ • OpenRouter {OPENROUTER_MODEL} • v53</div>
+    <div class="text-[11px] tracking-widest opacity-80">КНОПКА 2 • ЖИВОЙ РАЗБОР ПОДБОРЩИКА • OpenRouter {OPENROUTER_MODEL} • v57 LIVE</div>
     <h1 class="text-[24px] font-bold mt-2 leading-none">Предварительные рекомендации по {model_str}</h1>
     <div class="text-sm opacity-90 mt-1">VIN {vin} • Гос {meta.get('reg')} • Анализ на основе отчета истории (Кнопка 1) • Только для этого VIN</div>
   </div>
