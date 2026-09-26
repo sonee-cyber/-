@@ -1,765 +1,967 @@
 # -*- coding: utf-8 -*-
 """
-v62 REAL - NO HARDCODE - ALL SOURCES PARSED
-1. carsharing, taxi - badges
-2. eaisto - пробег с подписью источника
-3. osago - целиком
-4. zalog - целиком с деталями
-5. gibdd - целиком (owners, pts, sts, restrictions, wanted, regHistory)
-6. vindecode - целиком
-7. dtp - целиком с damagePoints
-8. offerbyvin - целиком (plate, pts, mileage, price, city, photos)
-9. nomerogram - целиком (text, title, price)
+v65.6 - ТЕКУЩИЙ ГОС В КАРТОЧКУ + ВСЕ ГОС ДЛЯ ОБЪЯВЛЕНИЙ
+- Карточка = строго по VIN (vindecode по VIN), но текущий госномер = самый свежий из всех источников
+- Объявления = по ВСЕМ гос что находим (ТО eaisto, pic, offerbyvin, servicemaintenance, vin2number)
+- servicemaintenance 26.3₽, gai 21₽, gibddhistory 2.1₽, autophoto 1.6₽
+- vindecode 1.1 + vindecode2 3.2 фолбек, offerbyvin+offerbygosnum по каждому гос, vin2number 6₽
 """
-import asyncio, os, re, json, base64
+import asyncio, os, re, json, base64, html as html_lib, logging, time
 from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APIPOINT_KEY = os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or ""
-APIPOINT_KEY = APIPOINT_KEY.strip()
+try:
+    from PIL import Image
+    from io import BytesIO
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot_v65")
+
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+APIPOINT_KEY = (os.getenv("APIPOINT_KEY") or os.getenv("APIPOINT_TOKEN") or "").strip()
+OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or "").strip()
+OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini").strip()
 APIPOINT_URL = "https://apipoint.ru/api/call"
-
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or ""
-OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-print(f"BOOT v62 REAL FULL PARSE 9 SOURCES model={OPENROUTER_MODEL} key={'yes' if OPENROUTER_API_KEY else 'NO KEY'}")
+if not BOT_TOKEN:
+    raise RuntimeError("Нет BOT_TOKEN")
+if not APIPOINT_KEY:
+    raise RuntimeError("Нет APIPOINT_KEY")
 
-LAST_REQUEST = {"vin": None, "reg": None}
-LAST_REPORT_DATA = {}
+print(f"BOOT v65.6 CURRENT GOS IN CARD + ALL GOS FOR ADS model={OPENROUTER_MODEL} pil={HAS_PIL}")
 
-async def apipoint_call(payload):
+USER_DATA: Dict[int, Dict[str, Any]] = {}
+CACHE: Dict[str, Tuple[float, Any]] = {}
+CACHE_TTL = 86400
+COOLDOWN: Dict[int, float] = {}
+MAX_B64_IMAGES = 6
+MAX_IMAGE_BYTES = 2_500_000
+_session: Optional[aiohttp.ClientSession] = None
+
+async def get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        timeout = aiohttp.ClientTimeout(total=90, connect=15)
+        _session = aiohttp.ClientSession(timeout=timeout)
+    return _session
+
+async def close_session():
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+
+def get_user_data(uid: int) -> Dict[str, Any]:
+    if uid not in USER_DATA:
+        USER_DATA[uid] = {"last_request": {"vin": None, "reg": None, "ts": 0}, "last_report": {}}
+    return USER_DATA[uid]
+
+def cache_get(k: str):
+    if k in CACHE:
+        exp, val = CACHE[k]
+        if time.time() < exp:
+            return val
+        del CACHE[k]
+    return None
+
+def cache_set(k: str, v: Any, ttl: int = CACHE_TTL):
+    CACHE[k] = (time.time() + ttl, v)
+
+def is_valid_vin(v: str) -> bool:
+    if not v: return False
+    v = v.upper().strip()
+    return len(v) == 17 and bool(re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", v))
+
+def parse_eaisto_date(d) -> str:
+    if not d: return ""
+    try:
+        if isinstance(d, (int, float)):
+            return datetime.fromtimestamp(int(d)).strftime("%d.%m.%Y")
+        s = str(d).strip()
+        if "." in s:
+            sp = s.split(".")[0]
+            if sp.isdigit() and len(sp) >= 10:
+                try:
+                    return datetime.fromtimestamp(int(sp[:10])).strftime("%d.%m.%Y")
+                except: pass
+        if s.isdigit():
+            if len(s) == 10:
+                try: return datetime.fromtimestamp(int(s)).strftime("%d.%m.%Y")
+                except: pass
+            if len(s) == 13:
+                try: return datetime.fromtimestamp(int(s)//1000).strftime("%d.%m.%Y")
+                except: pass
+        m = re.search(r'(\d{10})', s)
+        if m:
+            try: return datetime.fromtimestamp(int(m.group(1))).strftime("%d.%m.%Y")
+            except: pass
+        for fmt in ["%d.%m.%Y", "%Y-%m-%d"]:
+            try: return datetime.strptime(s[:10], fmt).strftime("%d.%m.%Y")
+            except: pass
+        return s[:10]
+    except:
+        return str(d)[:10]
+
+def parse_date_for_sort(d) -> datetime:
+    try:
+        if not d: return datetime.min
+        if isinstance(d, (int, float)):
+            return datetime.fromtimestamp(int(d))
+        s = str(d).strip()
+        if s.isdigit() and len(s) == 10:
+            return datetime.fromtimestamp(int(s))
+        if s.isdigit() and len(s) == 13:
+            return datetime.fromtimestamp(int(s)//1000)
+        # try  DD.MM.YYYY
+        for fmt in ["%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S"]:
+            try:
+                return datetime.strptime(s[:10], fmt)
+            except: pass
+        m = re.search(r'(\d{10})', s)
+        if m:
+            return datetime.fromtimestamp(int(m.group(1)))
+    except:
+        pass
+    return datetime.min
+
+async def apipoint_call(payload: Dict[str, Any], use_cache: bool = True) -> Tuple[int, Dict, str]:
+    cache_key = f"{payload.get('sources')}:{payload.get('vin') or payload.get('regNum') or payload.get('gosnumber') or payload.get('gosnomer') or ''}"
+    if use_cache:
+        c = cache_get(cache_key)
+        if c:
+            return 200, c, "CACHED"
     headers = {"Authorization": f"Bearer {APIPOINT_KEY}", "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
+    session = await get_session()
+    for attempt in range(2):
         try:
-            async with session.post(APIPOINT_URL, json=payload, headers=headers, timeout=90) as resp:
+            async with session.post(APIPOINT_URL, json=payload, headers=headers) as resp:
                 txt = await resp.text()
-                try:
-                    data = json.loads(txt)
-                except:
-                    data = {"raw": txt[:10000]}
+                try: data = json.loads(txt)
+                except: data = {"raw": txt[:10000]}
+                if resp.status == 429 and attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                if resp.status == 200 and use_cache:
+                    cache_set(cache_key, data)
                 return resp.status, data, txt[:20000]
+        except asyncio.TimeoutError:
+            if attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            return 0, {"error": "timeout"}, "timeout"
         except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(1)
+                continue
             return 0, {"error": str(e)}, str(e)
+    return 0, {"error": "retry"}, "retry"
 
-async def call_openrouter_ai(prompt_text, system_text="Ты — злой, честный автоподборщик из Москвы с 15 лет опыта. Ты ненавидишь перекупов. Твоя задача — спасти клиента от покупки хлама. Ты говоришь прямо, жестко, без воды, как другу в гараже. Если видишь косяк — говори прямо. Если данных нет — пиши 'нет данных', не выдумывай. Никаких фраз 'нужно проверить' — давай конкретику из цифр которые тебе дали."):
+async def call_openrouter_ai(prompt_text: str, system_text: str = None):
     if not OPENROUTER_API_KEY:
-        return None, "Нет ключа OPENROUTER_API_KEY"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://t.me/GljanTachkuBot",
-        "X-Title": "GljanTachkuBot AI recommendations"
-    }
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": prompt_text}
-        ],
-        "temperature": 0.4,
-        "max_tokens": 6000
-    }
+        return None, "Нет ключа OPENROUTER"
+    if not system_text:
+        system_text = "Ты — злой, честный автоподборщик из Москвы с 15 лет опыта. Ненавидишь перекупов. Говори прямо, жестко, без воды, как другу в гараже. Если данных нет — пиши 'нет данных', не выдумывай."
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://t.me/GljanTachkuBot", "X-Title": "GljanTachkuBot v65"}
+    payload = {"model": OPENROUTER_MODEL, "messages": [{"role": "system", "content": system_text}, {"role": "user", "content": prompt_text}], "temperature": 0.35, "max_tokens": 4000}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=90) as resp:
-                txt = await resp.text()
-                try:
-                    data = json.loads(txt)
-                except:
-                    return None, f"OpenRouter raw error: {txt[:1000]}"
-                if resp.status != 200:
-                    return None, f"OpenRouter {resp.status}: {txt[:1000]}"
-                choices = data.get("choices") or []
-                if choices:
-                    content = choices[0].get("message",{}).get("content") or choices[0].get("text") or ""
-                    return content.strip(), None
-                return None, f"No choices: {str(data)[:1000]}"
+        session = await get_session()
+        async with session.post(OPENROUTER_URL, json=payload, headers=headers) as resp:
+            txt = await resp.text()
+            try: data = json.loads(txt)
+            except: return None, f"OpenRouter raw: {txt[:1000]}"
+            if resp.status != 200:
+                return None, f"OpenRouter {resp.status}: {txt[:1000]}"
+            choices = data.get("choices") or []
+            if choices:
+                return (choices[0].get("message",{}).get("content") or "").strip(), None
+            return None, f"No choices {str(data)[:800]}"
     except Exception as e:
-        return None, f"Exception OpenRouter: {e}"
+        return None, f"Exception {e}"
 
-async def download_image_any(url):
-    if not url or len(url) < 15:
-        return None
-    if any(x in url.lower() for x in ["logo", "icon", "favicon"]):
-        return None
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36", "Accept": "image/avif,image/webp,image/apng,image/*,*/*"}
-    if "platesmania" in url:
-        headers["Referer"] = "https://platesmania.com/"
-    elif "apipoint.ru" in url:
-        headers["Referer"] = "https://apipoint.ru/"
-        headers["Authorization"] = f"Bearer {APIPOINT_KEY}"
+async def download_image_any(url: str) -> Optional[str]:
+    if not url or len(url) < 15: return None
+    low = url.lower()
+    if any(x in low for x in ["logo","icon","favicon","svg"]): return None
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*"}
+    if "platesmania" in low: headers["Referer"] = "https://platesmania.com/"
+    if "avto-nomer" in low: headers["Referer"] = "https://avto-nomer.ru/"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=25, allow_redirects=True) as resp:
-                ct = resp.headers.get("Content-Type","").lower()
-                if resp.status != 200:
-                    return None
-                if "text/html" in ct:
-                    return None
-                if "image" in ct or "octet" in ct or "jpeg" in ct or "jpg" in ct or "png" in ct:
-                    content = await resp.read()
-                    if len(content) > 6000:
-                        b64 = base64.b64encode(content).decode('utf-8')
-                        mime = "image/jpeg"
-                        if "png" in ct:
-                            mime = "image/png"
-                        return f"data:{mime};base64,{b64}"
+        session = await get_session()
+        async with session.get(url, headers=headers, allow_redirects=True) as resp:
+            if resp.status != 200: return None
+            ct = resp.headers.get("Content-Type","").lower()
+            if "text/html" in ct: return None
+            content = await resp.read()
+            if len(content) < 6000 or len(content) > MAX_IMAGE_BYTES: return None
+            if HAS_PIL:
+                try:
+                    img = Image.open(BytesIO(content)).convert("RGB")
+                    img.thumbnail((800,800))
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=80, optimize=True)
+                    content = buf.getvalue()
+                    mime = "image/jpeg"
+                except:
+                    mime = "image/jpeg"
+            else:
+                mime = "image/jpeg" if "jpeg" in ct or "jpg" in ct else "image/png"
+            b64 = base64.b64encode(content).decode('utf-8')
+            return f"data:{mime};base64,{b64}"
+    except:
+        return None
+
+def get_autoteka_hard_for_vin(vin: str, reg: Optional[str]):
+    return {
+        "model": "", "year": "", "vin": vin, "gos": reg or "не указан", "pts": "", "sts": "", "engine_code": "", "engine_vol": "", "type": "", "color": "", "gearbox": "", "body_number": "", "chassis_number": "", "frame_number": "", "owners": 0, "sales_history": 0, "dtp_count": 0,
+        "juridical": {"ограничения": "", "розыск": "", "залог_фнп": "", "арбитраж": "", "лизинг": ""},
+        "dtp": [], "carsharing": {"count": 0, "list": []}, "taxi": {"count": 0, "list": []},
+        "eaisto": {"cards": [], "last_mileage": 0}, "osago": {"policies": []}, "zalog": {"count": 0, "details": []},
+        "gibdd": {"owners": [], "restrictions": [], "wanted": [], "reg_history": [], "body_number": ""},
+        "vindecode_full": {}, "offerbyvin_full": {"offers": []}, "nomerogram_full": {"ads": []},
+        "service": {"count": 0, "records": []},
+        "gai": {"owners": [], "restrictions": [], "wanted": [], "reg_history": [], "count_owners": 0},
+        "gibddhistory": {"count": 0, "records": []},
+        "vin2number": {"gos": "", "list": [], "current": ""}
+    }
+
+def find_offers_list(obj):
+    if isinstance(obj, dict):
+        for k in ["offers","list","result","items"]:
+            v = obj.get(k)
+            if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
+                if any("mileage" in x or "plate" in x or "gosnomer" in x or "price" in x or "Title" in x for x in v[:2]):
+                    return v
+        for v in obj.values():
+            r = find_offers_list(v)
+            if r: return r
+    elif isinstance(obj, list) and len(obj)>0 and isinstance(obj[0], dict):
+        if any("mileage" in x or "plate" in x or "Title" in x for x in obj[:2]):
+            return obj
+        for item in obj:
+            r = find_offers_list(item)
+            if r: return r
+    return None
+
+def find_vindecode_dict(obj):
+    if isinstance(obj, dict):
+        if any(k.lower() in ["brand","make","model","modelname","year","productionyear"] for k in obj.keys()):
+            return obj
+        for v in obj.values():
+            if isinstance(v, dict):
+                r = find_vindecode_dict(v)
+                if r: return r
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        r = find_vindecode_dict(it)
+                        if r: return r
+    return None
+
+def get_nested_vindecode_data(raw):
+    try:
+        if isinstance(raw, dict):
+            if "vindecode2" in raw and isinstance(raw["vindecode2"], dict):
+                inner2 = raw["vindecode2"]
+                for key in ["Data","result","decode","info"]:
+                    if key in inner2 and isinstance(inner2[key], dict):
+                        cand = inner2[key]
+                        if isinstance(cand.get("Data"), dict):
+                            return cand.get("Data")
+                        if find_vindecode_dict(cand):
+                            return find_vindecode_dict(cand) or cand
+                if any(k.lower() in ["brand","make","model","complectation"] for k in inner2.keys()):
+                    return inner2
+                r = find_vindecode_dict(inner2)
+                if r: return r
+            if "vindecode" in raw and isinstance(raw["vindecode"], dict):
+                inner = raw["vindecode"]
+                if "decode" in inner and isinstance(inner["decode"], dict):
+                    dec = inner["decode"]
+                    if "Reports" in dec and isinstance(dec["Reports"], list) and dec["Reports"]:
+                        data = dec["Reports"][0].get("Data")
+                        if isinstance(data, dict): return data
+                    if "Data" in dec and isinstance(dec["Data"], dict): return dec["Data"]
+                r = find_vindecode_dict(inner)
+                if r: return r
+            if "decode" in raw and isinstance(raw["decode"], dict):
+                dec = raw["decode"]
+                if "Reports" in dec and isinstance(dec["Reports"], list) and dec["Reports"]:
+                    data = dec["Reports"][0].get("Data")
+                    if isinstance(data, dict): return data
+            r = find_vindecode_dict(raw)
+            if r: return r
+    except: pass
+    return None
+
+def parse_gos_from_vin2number(raw) -> Optional[str]:
+    try:
+        if not isinstance(raw, dict): return None
+        result = raw.get("result") or raw
+        for key in ["gosnumber","gosnomer","regNum","number","plate","gos"]:
+            v = result.get(key)
+            if v and isinstance(v, str) and len(v) >= 6:
+                if re.search(r'[АВЕКМНОРСТУХA-Z0-9]{2,}', v.upper()):
+                    return v.strip().upper()
+        inner = result.get("vin2number") or result.get("vin2Number") or {}
+        if isinstance(inner, dict):
+            for key in ["gosnumber","gosnomer","regNum","number","plate"]:
+                v = inner.get(key)
+                if v and isinstance(v, str) and len(v) >= 6:
+                    return v.strip().upper()
+            lst = inner.get("list") or inner.get("numbers") or inner.get("result") or []
+            if isinstance(lst, list) and lst:
+                first = lst[0]
+                if isinstance(first, str):
+                    return first.strip().upper()
+                if isinstance(first, dict):
+                    for k in ["gosnumber","gosnomer","number"]:
+                        vv = first.get(k)
+                        if vv: return str(vv).strip().upper()
+        if isinstance(result.get("list"), list) and result["list"]:
+            first = result["list"][0]
+            if isinstance(first, dict):
+                for k in ["gosnumber","gosnomer","number"]:
+                    vv = first.get(k)
+                    if vv: return str(vv).strip().upper()
     except:
         pass
     return None
 
-def get_autoteka_hard_for_vin(vin, reg):
-    # v62 - NO HARDCODE - только пустая структура, заполнится из реальных баз
-    return {
-        "model": "",
-        "year": "",
-        "vin": vin,
-        "gos": reg or "не указан",
-        "gos2": "",
-        "photos_online": 0,
-        "pts": "",
-        "sts": "",
-        "body_number": vin,
-        "engine_number": "",
-        "engine_code": "",
-        "engine_vol": "",
-        "type": "",
-        "color": "",
-        "model_code": "",
-        "production_date": "",
-        "gearbox": "",
-        "import": "", "osago": "", "recall": "",
-        "owners": 0, "sales_history": 0, "service_history": 0,
-        "commercial": "", "auction": "", "mileage": 0, "mileage_sc": False, "dtp_count": 0,
-        "juridical": {"ограничения": "", "розыск": "", "залог_фнп": "", "арбитраж": "", "лизинг": "", "птс_наличие": "", "штрафы": "", "регистрация_гибдд": ""},
-        "dtp": [],
-        # v62 новые поля - все источники целиком
-        "carsharing": {"count": 0, "list": []},
-        "taxi": {"count": 0, "list": []},
-        "eaisto": {"cards": [], "last_mileage": 0},
-        "osago": {"policies": []},
-        "zalog": {"count": 0, "details": []},
-        "gibdd": {"owners": [], "restrictions": [], "wanted": [], "reg_history": []},
-        "vindecode_full": {},
-        "offerbyvin_full": {"offers": []},
-        "nomerogram_full": {"ads": []}
-    }
+def parse_all_gos_from_vin2number(raw) -> list:
+    res = []
+    try:
+        result = raw.get("result") or raw
+        # list variants
+        for key in ["list","numbers","gosnumbers"]:
+            lst = result.get(key)
+            if isinstance(lst, list):
+                for item in lst:
+                    if isinstance(item, str) and len(item) >= 6:
+                        res.append(item.strip().upper())
+                    elif isinstance(item, dict):
+                        for k in ["gosnumber","gosnomer","number","plate"]:
+                            if item.get(k):
+                                res.append(str(item[k]).strip().upper())
+        inner = result.get("vin2number") or result.get("vin2Number") or {}
+        if isinstance(inner, dict):
+            for key in ["list","numbers"]:
+                lst = inner.get(key)
+                if isinstance(lst, list):
+                    for item in lst:
+                        if isinstance(item, str):
+                            res.append(item.strip().upper())
+                        elif isinstance(item, dict):
+                            for k in ["gosnumber","gosnomer","number"]:
+                                if item.get(k):
+                                    res.append(str(item[k]).strip().upper())
+            for k in ["gosnumber","gosnomer","number"]:
+                if inner.get(k):
+                    res.append(str(inner[k]).strip().upper())
+    except:
+        pass
+    return list(set([r for r in res if len(r)>=6]))
 
-
-async def check_history(vin, reg_num=None):
-    global LAST_REQUEST
-    if LAST_REQUEST["vin"] != vin:
-        if reg_num is None:
-            LAST_REQUEST["reg"] = None
-        LAST_REQUEST["vin"] = vin
-    if reg_num:
-        LAST_REQUEST["reg"] = reg_num
-    actual_reg = reg_num or LAST_REQUEST["reg"]
-
+async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Optional[int] = None) -> Dict[str, Any]:
+    vin = vin.upper().strip()
     combined = {
-        "meta": {"vin": vin, "reg": actual_reg or "не указан", "year": ""},
+        "meta": {"vin": vin, "reg": reg_num or "не указан", "year": "", "all_gos_found": []},
         "block1_pic": [], "block2_nomerogram": [], "block3_autophoto": [],
-        "probeg": [], "vindecode": {}, "zalog": {}, "dtp": {}, "carsharing": {}, "taxi": {}, "offerbyvin": {}, "gibdd": {}, "eaisto": {}, "osago": {},
-        "autoteka_hard": get_autoteka_hard_for_vin(vin, actual_reg), "all_b64": [], "raw": {}, "logs": []
+        "probeg": [], "all_b64": [], "raw": {}, "logs": [],
+        "autoteka_hard": get_autoteka_hard_for_vin(vin, reg_num)
     }
     logs = combined["logs"]
-    logs.append(f"START v62 FULL vin={vin} reg={actual_reg}")
+    logs.append(f"START v65.6 uid={user_id} vin={vin} reg={reg_num}")
 
-    # Helper to recursively find offers-like list
-    def find_offers_list(obj):
-        if isinstance(obj, dict):
-            # direct keys
-            for k in ["offers", "list", "result", "items"]:
-                v = obj.get(k)
-                if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
-                    # check if looks like offer (has mileage or plate or price)
-                    if any("mileage" in x or "plate" in x or "gosnomer" in x or "price" in x for x in v[:2]):
-                        return v
-            # search deeper
-            for v in obj.values():
-                res = find_offers_list(v)
-                if res:
-                    return res
-        elif isinstance(obj, list) and len(obj)>0 and isinstance(obj[0], dict):
-            if any("mileage" in x or "plate" in x for x in obj[:2]):
-                return obj
-            for item in obj:
-                res = find_offers_list(item)
-                if res:
-                    return res
-        return None
+    # --- Для сбора всех гос и определения текущего ---
+    all_gos_found = set()
+    gos_candidates_with_date = []  # list of (date, gos) для определения текущего
 
-    def find_vindecode_dict(obj):
-        # returns dict that looks like vindecode
-        if isinstance(obj, dict):
-            # if has brand/model/year keys
-            if any(k in obj for k in ["brand", "make", "model", "modelName", "year", "productionYear"]):
-                return obj
-            for v in obj.values():
-                if isinstance(v, dict):
-                    res = find_vindecode_dict(v)
-                    if res:
-                        return res
-                elif isinstance(v, list):
-                    for it in v:
-                        if isinstance(it, dict):
-                            res = find_vindecode_dict(it)
-                            if res:
-                                return res
-        return None
+    if reg_num and reg_num != "не указан":
+        g = reg_num.upper().strip()
+        all_gos_found.add(g)
+        gos_candidates_with_date.append((datetime.now(), g))
 
-    def parse_eaisto_date(d):
-        # handles timestamp int, float, string timestamp, and normal date strings
-        if not d:
-            return ""
-        try:
-            # int timestamp
-            if isinstance(d, (int, float)):
-                try:
-                    dt = datetime.fromtimestamp(int(d))
-                    return dt.strftime("%d.%m.%Y")
-                except:
-                    pass
-            s = str(d).strip()
-            # handle "1655510400.0" or "1655510400.000"
-            if "." in s:
-                s_part = s.split(".")[0]
-                if s_part.isdigit() and len(s_part) >= 10:
-                    try:
-                        dt = datetime.fromtimestamp(int(s_part[:10]))
-                        return dt.strftime("%d.%m.%Y")
-                    except:
-                        pass
-            if s.isdigit():
-                # if 10 digits - unix timestamp
-                if len(s) == 10:
-                    try:
-                        dt = datetime.fromtimestamp(int(s))
-                        return dt.strftime("%d.%m.%Y")
-                    except:
-                        pass
-                # if 13 digits - ms timestamp
-                if len(s) == 13:
-                    try:
-                        dt = datetime.fromtimestamp(int(s)//1000)
-                        return dt.strftime("%d.%m.%Y")
-                    except:
-                        pass
-            # try to find 10-digit timestamp inside string
-            import re as _re
-            m = _re.search(r'(\d{10})', s)
-            if m:
-                try:
-                    dt = datetime.fromtimestamp(int(m.group(1)))
-                    return dt.strftime("%d.%m.%Y")
-                except:
-                    pass
-            return s
-        except:
-            return str(d)
+    def add_gos_with_date(g, date_obj=None, source=""):
+        if not g: return None
+        gg = str(g).strip().upper()
+        if len(gg) < 6: return None
+        if not re.search(r'[АВЕКМНОРСТУХA-Z0-9]{2,}', gg): return None
+        all_gos_found.add(gg)
+        dt = date_obj if isinstance(date_obj, datetime) else parse_date_for_sort(date_obj) if date_obj else datetime.min
+        gos_candidates_with_date.append((dt, gg, source))
+        return gg
 
-    derived_reg = None
-    # 1. pic by vin
-    status, data_pic_vin, _ = await apipoint_call({"sources": "pic", "vin": vin})
-    combined["raw"]["pic_vin"] = data_pic_vin
-    logs.append(f"pic vin {vin} -> {status}")
-    try:
-        result = data_pic_vin.get("result") or {}
-        pic_obj = result.get("pic") or result
-        if isinstance(pic_obj, dict):
-            derived_reg = pic_obj.get("gosnomer") or None
-            if derived_reg and not actual_reg:
-                actual_reg = derived_reg
-                LAST_REQUEST["reg"] = derived_reg
-                combined["meta"]["reg"] = derived_reg
-                combined["autoteka_hard"]["gos"] = derived_reg
-            for url in (pic_obj.get("imageList") or [])[:20]:
-                b64 = await download_image_any(url)
-                item = {"source": "pic", "price": "1.50", "type": f"Архив по VIN {vin}", "date": "Архив ~2018", "url": url, "gosnomer": derived_reg or "", "desc": f"Архив по VIN {vin}"}
-                if b64:
-                    item["b64"] = b64
-                    combined["all_b64"].append(b64)
-                combined["block1_pic"].append(item)
-    except Exception as e:
-        logs.append(f"pic vin err {e}")
+    actual_reg = reg_num  # будет перезаписан на текущий в конце
 
-    # 2. СРАЗУ запрашиваем vindecode, offerbyvin, eaisto, probeg2, zalog, dtp, gibdd, osago, taxi, carsharing чтобы вытащить госномер
-    pre_sources = ["vindecode", "offerbyvin", "eaisto", "probeg2", "gibdd", "zalog", "dtp", "osago", "carsharing", "taxi"]
-    for src in pre_sources:
-        status, data_src, _ = await apipoint_call({"sources": src, "vin": vin})
-        combined["raw"][src] = data_src
-        logs.append(f"{src} -> {status}")
-        if src == "probeg2":
+    async def fetch_one(name: str, payload: dict):
+        st, data, _ = await apipoint_call(payload)
+        return name, st, data
+
+    first_sources = ["vindecode","offerbyvin","eaisto","probeg","probeg2","gibdd","zalog","dtp","osago","carsharing","taxi","servicemaintenance","gai","gibddhistory"]
+    tasks = []
+    if vin:
+        tasks.append(fetch_one("pic_vin", {"sources": "pic", "vin": vin}))
+        for src in first_sources:
+            tasks.append(fetch_one(src, {"sources": src, "vin": vin}))
+    else:
+        # если VIN так и не получили из frameapi — бьем что можем по гос/фрейму, vindecode пропустим
+        tasks.append(fetch_one("offerbyvin", {"sources": "offerbyvin", "vin": original_input}))  # вдруг найдет по фрейму как по VIN
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    pic_vin_data = None
+    for r in results:
+        if isinstance(r, Exception):
+            logs.append(f"first batch exc {r}")
+            continue
+        name, st, data = r
+        combined["raw"][name] = data
+        logs.append(f"{name} -> {st}")
+        if name == "pic_vin": pic_vin_data = data
+        if name == "probeg2":
             try:
-                res = data_src.get("result") or {}
+                res = data.get("result") or {}
                 lst = []
                 if isinstance(res, dict):
-                    if isinstance(res.get("result"), list):
-                        lst = res.get("result")
-                    elif isinstance(res.get("probeg2"), dict):
-                        lst = res.get("probeg2",{}).get("result",[])
-                    elif isinstance(res.get("list"), list):
-                        lst = res.get("list")
-                combined["probeg"] = lst
-            except:
-                pass
+                    if isinstance(res.get("result"), list): lst = res.get("result")
+                    elif isinstance(res.get("probeg2"), dict): lst = res.get("probeg2",{}).get("result",[])
+                    elif isinstance(res.get("list"), list): lst = res.get("list")
+                if lst:
+                    combined["probeg"] = lst
+            except: pass
+        if name == "probeg":
+            try:
+                res = data.get("result") or {}
+                # probeg отдает последнюю запись, структура: {"probeg":{"result":{...}}} или {"result":{mileage,...}}
+                inner = res.get("probeg") or res.get("result") or res
+                if isinstance(inner, dict):
+                    # может быть dict с одним пробегом
+                    if inner.get("mileage") or inner.get("probeg") or inner.get("Probeg"):
+                        # приводим к формату как в probeg2 для единого списка
+                        mileage = inner.get("mileage") or inner.get("probeg") or inner.get("Probeg") or inner.get("value") or 0
+                        date_str = inner.get("date") or inner.get("Date") or inner.get("dateString") or ""
+                        try:
+                            m_int = int(str(mileage).replace(" ","").replace("км",""))
+                        except:
+                            m_int = 0
+                        if m_int>0:
+                            # добавляем к общему списку, если probeg2 еще пустой — создаем
+                            if not combined["probeg"]:
+                                combined["probeg"] = []
+                            combined["probeg"].append({"DateString": str(date_str), "Probeg": m_int, "Source": "probeg 1.10₽ последняя запись"})
+                            logs.append(f"probeg -> {m_int} км {date_str}")
+                    elif isinstance(inner.get("result"), dict):
+                        # вложенный
+                        sub = inner.get("result")
+                        mileage = sub.get("mileage") or sub.get("probeg") or 0
+                        date_str = sub.get("date") or ""
+                        try:
+                            m_int = int(str(mileage).replace(" ",""))
+                        except:
+                            m_int = 0
+                        if m_int>0:
+                            if not combined["probeg"]:
+                                combined["probeg"] = []
+                            combined["probeg"].append({"DateString": str(date_str), "Probeg": m_int, "Source": "probeg 1.10₽ последняя запись"})
+                elif isinstance(inner, list) and inner:
+                    # вдруг список
+                    for item in inner:
+                        if isinstance(item, dict):
+                            mileage = item.get("mileage") or item.get("probeg") or 0
+                            date_str = item.get("date") or ""
+                            try:
+                                m_int = int(str(mileage).replace(" ",""))
+                            except:
+                                continue
+                            if m_int>0:
+                                if not combined["probeg"]:
+                                    combined["probeg"] = []
+                                combined["probeg"].append({"DateString": str(date_str), "Probeg": m_int, "Source": "probeg 1.10₽"})
+            except Exception as e:
+                logs.append(f"probeg parse err {e}")
 
-    # 3. Парсим offerbyvin СРАЗУ чтобы получить госномер для номерограм/автофото
+    # 1) pic по VIN
+    try:
+        if pic_vin_data:
+            result = pic_vin_data.get("result") or {}
+            pic_obj = result.get("pic") or result
+            if isinstance(pic_obj, dict):
+                gn = pic_obj.get("gosnomer") or pic_obj.get("gosnumber")
+                if gn:
+                    add_gos_with_date(gn, datetime.now(), "pic_vin")
+    except Exception as e:
+        logs.append(f"pic vin parse err {e}")
+
+    # 2) offerbyvin - все plates
     try:
         ob_raw = combined["raw"].get("offerbyvin",{}).get("result",{})
         offers = find_offers_list(ob_raw) or []
         if offers:
             combined["raw"]["offerbyvin_parsed"] = offers
             combined["autoteka_hard"]["offerbyvin_full"]["offers"] = offers
-            found_plate = None
-            for off in offers:
-                if not isinstance(off, dict):
-                    continue
-                plate = off.get("plate") or off.get("gosnomer") or off.get("regNum") or off.get("number") or ""
-                if plate and not found_plate:
-                    import re as _re
-                    if _re.search(r'[АВЕКМНОРСТУХA-Z0-9]{2,}', str(plate).upper()):
-                        found_plate = str(plate).strip()
-            if found_plate and (not actual_reg or actual_reg == "не указан"):
-                actual_reg = found_plate
-                combined["meta"]["reg"] = found_plate
-                LAST_REQUEST["reg"] = found_plate
-                combined["autoteka_hard"]["gos"] = found_plate
-                logs.append(f"offerbyvin found plate {found_plate} - will query nomerogram/autophoto")
+            for off in offers[:15]:
+                if not isinstance(off, dict): continue
+                plate = off.get("plate") or off.get("gosnomer") or off.get("regNum") or off.get("gosnumber") or ""
+                d = off.get("date") or off.get("publishDate") or off.get("created")
+                if plate:
+                    add_gos_with_date(plate, d, "offerbyvin")
     except Exception as e:
-        logs.append(f"offerbyvin early parse err {e}")
+        logs.append(f"offerbyvin early err {e}")
 
-    # 4. Теперь зная госномер - запрашиваем номерограм, автофото, pic по гос и offerbyvin по гос (иногда по VIN пусто, а по гос есть)
-    if actual_reg and actual_reg != "не указан":
-        # дополнительно дергаем offerbyvin по госномеру - часто там есть объявления когда по VIN пусто
-        try:
-            status_ob_gos, data_ob_gos, _ = await apipoint_call({"sources": "offerbyvin", "regNum": actual_reg})
-            logs.append(f"offerbyvin by reg {actual_reg} -> {status_ob_gos}")
-            if status_ob_gos == 200:
-                # мерджим с основным offerbyvin
-                offers_gos = find_offers_list(data_ob_gos.get("result",{})) or []
+    # 3) eaisto - ТО, берем все гос с датами
+    try:
+        ea_raw = combined["raw"].get("eaisto",{}).get("result",{})
+        ea_inner = ea_raw.get("eaisto") or ea_raw.get("result") or ea_raw
+        if isinstance(ea_inner, dict):
+            cards = ea_inner.get("result") or ea_inner.get("list") or ea_inner.get("cards") or []
+            if isinstance(cards, list):
+                for c in cards[:15]:
+                    if not isinstance(c, dict): continue
+                    gos = c.get("gosnumber") or c.get("gosnomer") or c.get("regNum") or c.get("number") or ""
+                    d = c.get("date") or c.get("issueDate") or c.get("createDate")
+                    if gos:
+                        add_gos_with_date(gos, d, "eaisto ТО")
+    except Exception as e:
+        logs.append(f"eaisto plate err {e}")
+
+    # 4) servicemaintenance
+    try:
+        sm_raw = combined["raw"].get("servicemaintenance",{}).get("result",{})
+        sm_inner = sm_raw.get("servicemaintenance") or sm_raw.get("result") or sm_raw
+        if isinstance(sm_inner, dict):
+            lst = sm_inner.get("list") or sm_inner.get("records") or sm_inner.get("result") or []
+            if isinstance(lst, list):
+                for rec in lst[:15]:
+                    if not isinstance(rec, dict): continue
+                    gos = rec.get("gosnumber") or rec.get("gosnomer") or rec.get("regNum") or ""
+                    d = rec.get("date") or rec.get("serviceDate")
+                    if gos:
+                        add_gos_with_date(gos, d, "servicemaintenance")
+    except Exception as e:
+        logs.append(f"servicemaintenance plate err {e}")
+
+    # 5) vin2number 6₽ - коммерческие базы, самый авторитетный для текущего гос
+    current_from_v2n = None
+    try:
+        logs.append(f"собрано {len(all_gos_found)} гос до vin2number, добиваю vin2number 6₽")
+        st_v2n, data_v2n, _ = await apipoint_call({"sources": "vin2number", "vin": vin}, use_cache=False)
+        combined["raw"]["vin2number"] = data_v2n
+        logs.append(f"vin2number -> {st_v2n}")
+        all_from_v2n = parse_all_gos_from_vin2number(data_v2n)
+        for g in all_from_v2n:
+            add_gos_with_date(g, datetime.now(), "vin2number комм.база")
+        gos_from_v2n = parse_gos_from_vin2number(data_v2n)
+        if gos_from_v2n:
+            current_from_v2n = gos_from_v2n
+            add_gos_with_date(gos_from_v2n, datetime.now(), "vin2number CURRENT")
+            logs.append(f"vin2number текущий гос {gos_from_v2n}, всего {len(all_gos_found)}")
+    except Exception as e:
+        logs.append(f"vin2number err {e}")
+
+    # --- Определяем ТЕКУЩИЙ госномер для карточки ---
+    # Приоритет: vin2number (коммерческие базы = самый свежий) > последний по дате из ТО/сервиски/объявлений > первый найденный
+    current_gos = None
+    if current_from_v2n:
+        current_gos = current_from_v2n
+        logs.append(f"текущий гос из vin2number: {current_gos}")
+    else:
+        # ищем самый свежий по дате среди кандидатов
+        if gos_candidates_with_date:
+            # сортируем по дате desc, у кого дата = min ставим в конец
+            dated = [(d if isinstance(d, datetime) else parse_date_for_sort(d), g, src) for d,g,src in [x if len(x)==3 else (x[0], x[1], "") for x in gos_candidates_with_date]]
+            dated_sorted = sorted(dated, key=lambda x: x[0], reverse=True)
+            # берем первый у кого дата не min
+            for dt, g, src in dated_sorted:
+                if dt != datetime.min and g:
+                    current_gos = g
+                    logs.append(f"текущий гос из {src} по дате {dt}: {g}")
+                    break
+            if not current_gos:
+                # если все даты пустые - берем последний добавленный
+                current_gos = dated_sorted[0][1] if dated_sorted else None
+                logs.append(f"текущий гос из последнего кандидата: {current_gos}")
+
+    if not current_gos and all_gos_found:
+        current_gos = list(all_gos_found)[0]
+        logs.append(f"текущий гос fallback из all_gos_found: {current_gos}")
+
+    # Ставим текущий в карточку
+    if current_gos:
+        actual_reg = current_gos
+        combined["meta"]["reg"] = current_gos
+        combined["meta"]["current_gos"] = current_gos
+        combined["autoteka_hard"]["gos"] = current_gos
+        combined["autoteka_hard"]["vin2number"]["current"] = current_gos
+        combined["autoteka_hard"]["vin2number"]["gos"] = current_gos
+        logs.append(f"✅ ТЕКУЩИЙ ГОС В КАРТОЧКУ: {current_gos}")
+
+    combined["meta"]["all_gos_found"] = list(all_gos_found)
+    combined["autoteka_hard"]["vin2number"]["list"] = list(all_gos_found)
+    logs.append(f"ИТОГО госномеров для объявлений: {list(all_gos_found)} | текущий в карточку: {current_gos}")
+
+    # Этап 2: по госномеру - объявления по ВСЕМ гос, остальное по текущему
+    second_tasks = []
+    if all_gos_found:
+        for idx, gos in enumerate(list(all_gos_found)[:5]):
+            second_tasks.append(fetch_one(f"offerbygosnum_{idx}_{gos}", {"sources": "offerbygosnum", "gosnumber": gos}))
+            second_tasks.append(fetch_one(f"offerbyvin_by_reg_{idx}_{gos}", {"sources": "offerbyvin", "regNum": gos}))
+        if actual_reg and actual_reg != "не указан":
+            second_tasks.append(fetch_one("vindecode_by_reg", {"sources": "vindecode", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("gibdd_by_reg", {"sources": "gibdd", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("dtp_by_reg", {"sources": "dtp", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("osago_by_reg", {"sources": "osago", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("pic_gos", {"sources": "pic", "gosnomer": actual_reg}))
+            second_tasks.append(fetch_one("nomerogram", {"sources": "nomerogram", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("autophoto", {"sources": "autophoto", "regNum": actual_reg}))
+    elif actual_reg and actual_reg != "не указан":
+        second_tasks.append(fetch_one("offerbyvin_by_reg", {"sources": "offerbyvin", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("offerbygosnum", {"sources": "offerbygosnum", "gosnumber": actual_reg}))
+        second_tasks.append(fetch_one("vindecode_by_reg", {"sources": "vindecode", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("gibdd_by_reg", {"sources": "gibdd", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("dtp_by_reg", {"sources": "dtp", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("osago_by_reg", {"sources": "osago", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("pic_gos", {"sources": "pic", "gosnomer": actual_reg}))
+        second_tasks.append(fetch_one("nomerogram", {"sources": "nomerogram", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("autophoto", {"sources": "autophoto", "regNum": actual_reg}))
+
+    if second_tasks:
+        second_results = await asyncio.gather(*second_tasks, return_exceptions=True)
+        for r in second_results:
+            if isinstance(r, Exception):
+                logs.append(f"second exc {r}")
+                continue
+            name, st, data = r
+            combined["raw"][name] = data
+            gos_log = name.split("_")[-1] if "_" in name else actual_reg
+            logs.append(f"{name} {gos_log} -> {st}")
+            if name.startswith("offerby") and st == 200:
+                offers_gos = find_offers_list(data.get("result",{})) or []
+                if not offers_gos:
+                    inner = data.get("result",{}).get("offerbygosnum") or data.get("result",{}).get("offerbyvin") or data.get("result",{})
+                    if isinstance(inner, dict):
+                        offers_gos = inner.get("list") or inner.get("offers") or inner.get("result") or []
+                        if not isinstance(offers_gos, list): offers_gos = []
                 if offers_gos:
                     existing = combined["raw"].get("offerbyvin_parsed") or []
-                    # объединяем без дублей
-                    combined["raw"]["offerbyvin_parsed"] = existing + [o for o in offers_gos if o not in existing]
-                    combined["raw"]["offerbyvin_by_reg"] = data_ob_gos
-                    logs.append(f"offerbyvin by reg found {len(offers_gos)} offers")
-        except Exception as e:
-            logs.append(f"offerbyvin by reg err {e}")
+                    merged = existing[:]
+                    for new_off in offers_gos:
+                        if new_off not in merged:
+                            merged.append(new_off)
+                    combined["raw"]["offerbyvin_parsed"] = merged
+                    logs.append(f"{name} +{len(offers_gos)} объяв (гос {gos_log}), всего {len(merged)}")
+            if name.startswith("gibdd_by_reg") or name.startswith("dtp_by_reg") or name.startswith("osago_by_reg"):
+                base = name.split("_by_reg")[0]
+                if not combined["raw"].get(base) or not combined["raw"].get(base,{}).get("result"):
+                    combined["raw"][base] = data
 
-        # также пробуем vindecode по гос? иногда помогает
-        try:
-            status_vd_gos, data_vd_gos, _ = await apipoint_call({"sources": "vindecode", "regNum": actual_reg})
-            logs.append(f"vindecode by reg {actual_reg} -> {status_vd_gos}")
-            if status_vd_gos == 200:
-                combined["raw"]["vindecode_by_reg"] = data_vd_gos
-        except:
-            pass
+    # Фото
+    photo_urls = []
+    try:
+        if pic_vin_data:
+            result = pic_vin_data.get("result") or {}
+            pic_obj = result.get("pic") or result
+            if isinstance(pic_obj, dict):
+                for url in (pic_obj.get("imageList") or [])[:10]:
+                    photo_urls.append(("pic", url, f"Архив VIN {vin}"))
+        pic_gos_data = combined["raw"].get("pic_gos",{}).get("result",{})
+        if pic_gos_data:
+            pic_obj = pic_gos_data.get("pic") or pic_gos_data
+            if isinstance(pic_obj, dict):
+                for url in (pic_obj.get("imageList") or [])[:10]:
+                    photo_urls.append(("pic_gos", url, f"Архив гос {actual_reg}"))
+        auto_raw = combined["raw"].get("autophoto",{}).get("result",{})
+        auto_inner = auto_raw.get("autophoto") or auto_raw.get("result") or auto_raw
+        if isinstance(auto_inner, dict):
+            records = auto_inner.get("records") or auto_inner.get("list") or auto_inner.get("result") or []
+            for rec in records[:15]:
+                if not isinstance(rec, dict): continue
+                best = rec.get("bigPhoto") or rec.get("urlphoto") or rec.get("urlPhoto") or ""
+                if best:
+                    if best.startswith("/"):
+                        if "avto" in best or "ru31" in best:
+                            best = "https://avto-nomer.ru" + best
+                        else:
+                            best = "https://platesmania.com" + best
+                    photo_urls.append(("autophoto", best, f"Улица {rec.get('date','')[:10]}"))
+        nom_raw = combined["raw"].get("nomerogram",{}).get("result",{})
+        nom_inner = nom_raw.get("nomerogram") or nom_raw.get("result") or nom_raw
+        if isinstance(nom_inner, dict):
+            rez = nom_inner.get("rez") or nom_inner.get("list") or nom_inner.get("result") or []
+            for r in rez[:10]:
+                if not isinstance(r, dict): continue
+                imgs = r.get("img") or []
+                for img_url in imgs[:3]:
+                    if img_url and len(str(img_url)) > 15:
+                        photo_urls.append(("nomerogram", img_url, f"Номерограм {r.get('date','')[:10]}"))
+    except Exception as e:
+        logs.append(f"photo urls parse err {e}")
 
-        # pic by gos if not already
-        if not derived_reg or derived_reg != actual_reg:
-            status, data_pic_gos, _ = await apipoint_call({"sources": "pic", "gosnomer": actual_reg})
-            logs.append(f"pic gos {actual_reg} -> {status}")
-            try:
-                result = data_pic_gos.get("result") or {}
-                pic_obj = result.get("pic") or result
-                if isinstance(pic_obj, dict):
-                    for url in (pic_obj.get("imageList") or [])[:20]:
-                        if any(x["url"] == url for x in combined["block1_pic"]):
-                            continue
-                        b64 = await download_image_any(url)
-                        item = {"source": "pic", "price": "1.50", "type": f"Архив по гос {actual_reg}", "date": "Архив по гос", "url": url, "gosnomer": actual_reg, "desc": f"Архив по гос {actual_reg}"}
-                        if b64:
-                            item["b64"] = b64
-                            combined["all_b64"].append(b64)
-                        combined["block1_pic"].append(item)
-            except:
-                pass
+    photo_urls = photo_urls[:20]
+    if photo_urls:
+        async def dl_one(item):
+            src, url, typ = item
+            b64 = await download_image_any(url)
+            return src, url, typ, b64
+        dl_results = await asyncio.gather(*[dl_one(u) for u in photo_urls], return_exceptions=True)
+        for r in dl_results:
+            if isinstance(r, Exception): continue
+            src, url, typ, b64 = r
+            item_dict = {"source": src, "type": typ, "url": url, "gosnomer": actual_reg or "", "desc": typ}
+            if b64 and len(combined["all_b64"]) < MAX_B64_IMAGES:
+                item_dict["b64"] = b64
+                combined["all_b64"].append(b64)
+            combined["block1_pic"].append(item_dict)
 
-        status, data_nomer, _ = await apipoint_call({"sources": "nomerogram", "regNum": actual_reg})
-        combined["raw"]["nomerogram"] = data_nomer
-        logs.append(f"nomerogram {actual_reg} -> {status}")
-        try:
-            result = data_nomer.get("result") or {}
-            nom = result.get("nomerogram") or result
-            rez = nom.get("rez") if isinstance(nom, dict) else []
-            if isinstance(rez, list):
-                for r in rez[:20]:
-                    if not isinstance(r, dict):
-                        continue
-                    date = r.get("date") or ""
-                    url = r.get("url") or ""
-                    text = r.get("text") or ""
-                    title = r.get("title") or ""
-                    source = r.get("source") or ""
-                    price = r.get("price") or ""
-                    mileage = r.get("mileage") or r.get("probeg") or ""
-                    imgs = r.get("img") or []
-                    combined["autoteka_hard"]["nomerogram_full"]["ads"].append({
-                        "date": date, "url": url, "text": str(text)[:2000], "title": title, "source": source, "price": price, "mileage": mileage
-                    })
-                    if isinstance(imgs, list) and imgs:
-                        for img_url in imgs[:10]:
-                            b64 = await download_image_any(img_url)
-                            item = {"source": source or "nomerogram", "price": "1.30", "type": f"Номерограм {actual_reg}", "date": date, "url": url, "title": title, "desc": str(text)[:1000], "price_val": price, "mileage": mileage, "img_url": img_url}
-                            if b64:
-                                item["b64"] = b64
-                                combined["all_b64"].append(b64)
-                            combined["block2_nomerogram"].append(item)
-        except Exception as e:
-            logs.append(f"nomerogram err {e}")
-
-        status, data_auto, _ = await apipoint_call({"sources": "autophoto", "regNum": actual_reg})
-        combined["raw"]["autophoto"] = data_auto
-        logs.append(f"autophoto {actual_reg} -> {status}")
-        try:
-            result = data_auto.get("result") or {}
-            ap = result.get("autophoto") or result
-            records = ap.get("records") if isinstance(ap, dict) else []
-            if isinstance(records, list):
-                for rec in records[:20]:
-                    if not isinstance(rec, dict):
-                        continue
-                    date = rec.get("date") or ""
-                    bigPhoto = rec.get("bigPhoto") or ""
-                    urlphoto = rec.get("urlphoto") or ""
-                    best = bigPhoto or urlphoto
-                    b64 = await download_image_any(best) if best else None
-                    item = {"source": "platesmania.com", "price": "1.60", "type": f"Фото пользователей {actual_reg}", "date": date, "name": rec.get("name") or "", "urlphoto": urlphoto, "bigPhoto": bigPhoto, "urlNumber": rec.get("urlNumber") or "", "desc": f"platesmania {date}"}
-                    if b64:
-                        item["b64"] = b64
-                        combined["all_b64"].append(b64)
-                    combined["block3_autophoto"].append(item)
-        except Exception as e:
-            logs.append(f"autophoto err {e}")
-    else:
-        logs.append(f"SKIP nomerogram/autophoto - нет госномера даже после offerbyvin")
-
-    # --- v62 FULL PARSE ALL 9 SOURCES ROBUST ---
+    # --- Парсинг в autoteka_hard ---
     try:
         ah = combined["autoteka_hard"]
-        # 6. vindecode целиком - robust with deep search and many key variants
         vd_raw = combined["raw"].get("vindecode",{}).get("result",{})
-        vd = None
-        # try many nesting levels
-        for attempt in [find_vindecode_dict(vd_raw), vd_raw.get("vindecode"), vd_raw.get("result"), vd_raw]:
-            if isinstance(attempt, dict):
-                vd = attempt
-                # if this dict itself has vindecode inside, dive
-                if "vindecode" in vd and isinstance(vd["vindecode"], dict):
-                    vd = vd["vindecode"]
-                if "result" in vd and isinstance(vd["result"], dict) and any(k in vd["result"] for k in ["brand","make","model","year"]):
-                    vd = vd["result"]
-                if find_vindecode_dict(vd):
-                    vd = find_vindecode_dict(vd)
-                    break
-                if any(k in vd for k in ["brand","make","model","year","manufacturer"]):
-                    break
-        if isinstance(vd, dict):
-            # final deep search
-            deep = find_vindecode_dict(vd)
-            if deep:
-                vd = deep
+        vd = get_nested_vindecode_data(vd_raw)
+        if not vd:
+            vd_raw_reg = combined["raw"].get("vindecode_by_reg",{}).get("result",{})
+            vd = get_nested_vindecode_data(vd_raw_reg)
+        if not vd or len(vd) < 2:
+            logs.append("vindecode пустой -> пробую vindecode2 3.20₽")
+            try:
+                st2, data2, _ = await apipoint_call({"sources": "vindecode2", "vin": vin}, use_cache=False)
+                combined["raw"]["vindecode2"] = data2
+                logs.append(f"vindecode2 -> {st2}")
+                vd2_raw = data2.get("result",{})
+                vd2 = get_nested_vindecode_data(vd2_raw)
+                if not vd2 and isinstance(vd2_raw, dict):
+                    if isinstance(vd2_raw.get("vindecode2"), dict):
+                        vd2 = get_nested_vindecode_data({"vindecode2": vd2_raw.get("vindecode2")})
+                    else:
+                        if any(k.lower() in ["brand","make","complectation","engine"] for k in vd2_raw.keys()):
+                            vd2 = vd2_raw
+                if isinstance(vd2, dict) and vd2:
+                    vd = vd2
+            except Exception as e:
+                logs.append(f"vindecode2 err {e}")
+
+        if isinstance(vd, dict) and vd:
             ah["vindecode_full"] = vd
-            # log keys for debug
-            logs.append(f"vindecode keys: {list(vd.keys())[:20]}")
-        else:
-            logs.append(f"vindecode empty or not dict: {type(vd)} raw keys {list(vd_raw.keys()) if isinstance(vd_raw, dict) else 'not dict'}")
-            vd = {}
-            brand = vd.get("brand") or vd.get("make") or vd.get("manufacturer") or ""
-            model = vd.get("model") or vd.get("modelName") or ""
-            year = vd.get("year") or vd.get("productionYear") or vd.get("yearOfManufacture") or vd.get("modelYear") or ""
-            engine_vol = vd.get("engineVolume") or vd.get("engine") or vd.get("engineSize") or vd.get("displacement") or vd.get("engine_volume") or ""
-            power = vd.get("power") or vd.get("enginePower") or vd.get("powerHp") or ""
-            body = vd.get("body") or vd.get("bodyType") or vd.get("vehicleType") or ""
-            color = vd.get("color") or vd.get("bodyColor") or ""
-            engine_code = vd.get("engineCode") or vd.get("engineModel") or vd.get("engineType") or ""
-            gearbox = vd.get("gearbox") or vd.get("transmission") or vd.get("gearboxType") or ""
-            fuel = vd.get("fuel") or vd.get("fuelType") or ""
-            drive = vd.get("drive") or vd.get("driveType") or ""
-            if brand or model:
-                if not ah.get("model"):
-                    ah["model"] = f"{brand} {model}".strip()
+            def get_ci(d,*keys):
+                if not isinstance(d, dict): return ""
+                lm = {k.lower(): v for k,v in d.items()}
+                for k in keys:
+                    if k.lower() in lm: return lm[k.lower()]
+                return ""
+            brand = get_ci(vd,"brand","make","BrandName") or ""
+            model = get_ci(vd,"model","modelName") or ""
+            year = get_ci(vd,"year","productionYear","modelYear","Year") or ""
+            ev_raw = get_ci(vd,"engineVolume","EngineVolume")
+            engine_vol = str(ev_raw.get("L") or ev_raw.get("Ccm") or ev_raw) if isinstance(ev_raw, dict) else str(ev_raw or "")
+            pow_raw = get_ci(vd,"enginePower","power")
+            power = str(pow_raw.get("Hp") or pow_raw.get("PS") or pow_raw) if isinstance(pow_raw, dict) else str(pow_raw or "")
+            color = get_ci(vd,"color","bodyColor") or ""
+            body = get_ci(vd,"body","BodyName","bodyType") or ""
+            gearbox = get_ci(vd,"gearbox","transmission") or ""
+            if brand or model: ah["model"] = f"{brand} {model}".strip()
             if year:
                 ah["year"] = str(year)
                 combined["meta"]["year"] = str(year)
             if engine_vol or power:
-                if not ah.get("engine_vol"):
-                    ah["engine_vol"] = f"{engine_vol} {power}".strip() if power else str(engine_vol)
-            if engine_code:
-                if not ah.get("engine_code"):
-                    ah["engine_code"] = str(engine_code)
-            if color:
-                if not ah.get("color"):
-                    ah["color"] = str(color)
-            if body:
-                if not ah.get("type"):
-                    ah["type"] = str(body)
-            if gearbox:
-                if not ah.get("gearbox"):
-                    ah["gearbox"] = str(gearbox)
-            pts_vd = vd.get("pts") or vd.get("ptsNumber") or vd.get("vehiclePassportNumber") or ""
-            if pts_vd and not ah.get("pts"):
-                ah["pts"] = str(pts_vd)
+                ah["engine_vol"] = f"{engine_vol} {power} л.с.".strip() if engine_vol and power else (engine_vol or power)
+            if color: ah["color"] = str(color)
+            if body: ah["type"] = str(body)
+            if gearbox: ah["gearbox"] = str(gearbox)
 
-        # 5. gibdd целиком
         gib_raw = combined["raw"].get("gibdd",{}).get("result",{})
         gib = gib_raw.get("gibdd") or gib_raw.get("result") or gib_raw
         if isinstance(gib, dict):
             if isinstance(gib.get("ownershipPeriods"), list) and gib.get("ownershipPeriods"):
                 ah["owners"] = len(gib.get("ownershipPeriods"))
                 ah["gibdd"]["owners"] = gib.get("ownershipPeriods")
-                last = gib.get("ownershipPeriods")[-1]
-                if isinstance(last, dict) and last.get("pts") and not ah.get("pts"):
-                    ah["pts"] = str(last.get("pts"))
             if isinstance(gib.get("registrationHistory"), list):
                 ah["gibdd"]["reg_history"] = gib.get("registrationHistory")
             if isinstance(gib.get("restrictions"), list):
                 ah["gibdd"]["restrictions"] = gib.get("restrictions")
-                if gib.get("restrictions"):
-                    ah["juridical"]["ограничения"] = f"Найдено {len(gib.get('restrictions'))} огр."
-                else:
-                    ah["juridical"]["ограничения"] = "Не найдены"
-            elif isinstance(gib.get("restrict"), list):
-                ah["gibdd"]["restrictions"] = gib.get("restrict")
+                ah["juridical"]["ограничения"] = f"Найдено {len(gib.get('restrictions'))}" if gib.get("restrictions") else "Не найдены"
             if isinstance(gib.get("wanted"), list):
                 ah["gibdd"]["wanted"] = gib.get("wanted")
                 ah["juridical"]["розыск"] = f"Найдено {len(gib.get('wanted'))}" if gib.get("wanted") else "Не найден"
-            for k in ["pts", "ptsNumber", "vehiclePassport", "sts", "stsNumber"]:
-                if gib.get(k) and not ah.get(k if k in ["pts","sts"] else ""):
-                    if "pts" in k.lower() and not ah.get("pts"):
-                        ah["pts"] = str(gib.get(k))[:60]
-                    if "sts" in k.lower() and not ah.get("sts"):
-                        ah["sts"] = str(gib.get(k))[:60]
 
-        # 7. dtp целиком
+        try:
+            gai_raw = combined["raw"].get("gai",{}).get("result",{})
+            gai_inner = gai_raw.get("gai") or gai_raw.get("result") or gai_raw
+            if isinstance(gai_inner, dict):
+                if isinstance(gai_inner.get("ownershipPeriods"), list):
+                    ah["gai"]["owners"] = gai_inner.get("ownershipPeriods")
+                    ah["gai"]["count_owners"] = len(gai_inner.get("ownershipPeriods"))
+                    if not ah["owners"]:
+                        ah["owners"] = len(gai_inner.get("ownershipPeriods"))
+                if isinstance(gai_inner.get("restrictions"), list):
+                    ah["gai"]["restrictions"] = gai_inner.get("restrictions")
+                    if gai_inner.get("restrictions"):
+                        ah["juridical"]["ограничения"] = f"GAI: {len(gai_inner.get('restrictions'))} огр."
+                    elif not ah["juridical"]["ограничения"]:
+                        ah["juridical"]["ограничения"] = "Не найдены (gai)"
+                if isinstance(gai_inner.get("wanted"), list):
+                    ah["gai"]["wanted"] = gai_inner.get("wanted")
+                    if gai_inner.get("wanted"):
+                        ah["juridical"]["розыск"] = f"GAI: в розыске {len(gai_inner.get('wanted'))}"
+                if isinstance(gai_inner.get("registrationHistory"), list):
+                    ah["gai"]["reg_history"] = gai_inner.get("registrationHistory")
+        except Exception as e:
+            logs.append(f"gai parse err {e}")
+
+        try:
+            gh_raw = combined["raw"].get("gibddhistory",{}).get("result",{})
+            gh_inner = gh_raw.get("gibddhistory") or gh_raw.get("result") or gh_raw
+            records = []
+            if isinstance(gh_inner, dict):
+                if isinstance(gh_inner.get("list"), list): records = gh_inner.get("list")
+                elif isinstance(gh_inner.get("history"), list): records = gh_inner.get("history")
+                elif isinstance(gh_inner.get("result"), list): records = gh_inner.get("result")
+                elif isinstance(gh_inner.get("ownershipPeriods"), list): records = gh_inner.get("ownershipPeriods")
+            elif isinstance(gh_inner, list):
+                records = gh_inner
+            ah["gibddhistory"]["records"] = records[:30]
+            ah["gibddhistory"]["count"] = len(records)
+            if records and not ah["owners"]:
+                ah["owners"] = len(records)
+        except Exception as e:
+            logs.append(f"gibddhistory parse err {e}")
+
         try:
             dtp_raw = combined["raw"].get("dtp",{}).get("result",{})
             dtp_inner = dtp_raw.get("dtp") or dtp_raw
             dtp_list = []
             if isinstance(dtp_inner, dict):
-                if isinstance(dtp_inner.get("list"), list):
-                    dtp_list = dtp_inner.get("list")
-                elif isinstance(dtp_inner.get("result"), list):
-                    dtp_list = dtp_inner.get("result")
-                elif isinstance(dtp_inner.get("accidents"), list):
-                    dtp_list = dtp_inner.get("accidents")
-                count = dtp_inner.get("count") or dtp_inner.get("total") or len(dtp_list)
+                if isinstance(dtp_inner.get("list"), list): dtp_list = dtp_inner.get("list")
+                elif isinstance(dtp_inner.get("result"), list): dtp_list = dtp_inner.get("result")
+                count = dtp_inner.get("count") or len(dtp_list)
                 ah["dtp_count"] = count
-                norm = []
-                for d in dtp_list[:10]:
-                    if not isinstance(d, dict):
-                        continue
-                    norm.append({
-                        "date": parse_eaisto_date(d.get("date") or d.get("accidentDate") or d.get("eventDate") or ""),
-                        "type": d.get("type") or d.get("accidentType") or "ДТП",
-                        "damage": d.get("damage") or d.get("damageType") or "Нет данных",
-                        "damagePoints": d.get("damagePoints") or d.get("damagedParts") or [],
-                        "region": d.get("region") or d.get("place") or "",
-                        "participants": d.get("participants") or 0,
-                        "cost": d.get("cost") or d.get("damageCost") or ""
-                    })
-                ah["dtp"] = norm
             elif isinstance(dtp_inner, list):
+                dtp_list = dtp_inner
                 ah["dtp_count"] = len(dtp_inner)
-                ah["dtp"] = [{"date": parse_eaisto_date(d.get("date","")), "type": d.get("type","ДТП"), "damage": d.get("damage",""), "damagePoints": d.get("damagePoints",[]), "region": d.get("region",""), "participants":0, "cost":""} for d in dtp_inner[:10] if isinstance(d, dict)]
+            norm = []
+            for d in dtp_list[:10]:
+                if not isinstance(d, dict): continue
+                norm.append({"date": parse_eaisto_date(d.get("date") or d.get("accidentDate") or ""), "type": d.get("type") or "ДТП", "damage": d.get("damage") or "Нет данных", "damagePoints": d.get("damagePoints") or [], "region": d.get("region") or ""})
+            ah["dtp"] = norm
         except Exception as e:
             logs.append(f"dtp parse err {e}")
 
-        # 8. offerbyvin целиком - уже нашли offers ранее, но дополним
         try:
-            offers = combined["raw"].get("offerbyvin_parsed") or find_offers_list(combined["raw"].get("offerbyvin",{}).get("result",{})) or []
+            offers = combined["raw"].get("offerbyvin_parsed") or []
             if offers:
-                combined["raw"]["offerbyvin_parsed"] = offers
                 ah["offerbyvin_full"]["offers"] = offers
-                found_pts = None
-                found_sts = None
-                for off in offers:
-                    if not isinstance(off, dict):
-                        continue
-                    pts = off.get("ptsNumber") or off.get("pts") or off.get("vehiclePassportNumber") or ""
-                    if pts and not ah.get("pts"):
-                        ah["pts"] = str(pts)
-                    sts = off.get("stsNumber") or off.get("sts") or ""
-                    if sts and not ah.get("sts"):
-                        ah["sts"] = str(sts)
-                # Пробег из объявлений с подписью источника
-                for off in offers:
-                    if not isinstance(off, dict):
-                        continue
-                    d = parse_eaisto_date(off.get("date") or off.get("publishDate") or off.get("created") or "")
-                    m = off.get("mileage") or off.get("probeg") or off.get("odometer") or 0
-                    try:
-                        m_int = int(str(m).replace(" ", "").replace("км","").strip() or 0)
-                        if m_int > 0:
-                            # check if already exists to avoid duplicates
-                            if not any(abs(x.get("Probeg",0)-m_int)<100 for x in combined["probeg"] if isinstance(x, dict)):
-                                combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"Авито {off.get('city','')} {off.get('price','')}₽"})
-                    except:
-                        pass
                 ah["sales_history"] = len(offers)
-                # Фото из объявлений если pic пустой
-                if not combined["block1_pic"] and not combined["block2_nomerogram"]:
-                    for off in offers[:3]:
-                        if not isinstance(off, dict):
-                            continue
-                        imgs = off.get("photos") or off.get("images") or off.get("img") or off.get("imageList") or []
-                        if isinstance(imgs, list):
-                            for img_url in imgs[:10]:
-                                if isinstance(img_url, dict):
-                                    img_url = img_url.get("url") or img_url.get("big") or ""
-                                if not img_url or len(str(img_url)) < 15:
-                                    continue
-                                if len(combined["all_b64"]) >= 15:
-                                    break
-                                b64 = await download_image_any(str(img_url))
-                                item = {"source": "offerbyvin", "price": "Авито", "type": f"Объявление {off.get('date','')}", "date": parse_eaisto_date(off.get("date","")), "url": str(img_url)[:200], "desc": f"Авито {off.get('price','')} {off.get('mileage','')}км {off.get('city','')}"}
-                                if b64:
-                                    item["b64"] = b64
-                                    combined["all_b64"].append(b64)
-                                combined["block1_pic"].append(item)
+                for off in offers:
+                    if not isinstance(off, dict): continue
+                    d = parse_eaisto_date(off.get("date") or "")
+                    m = off.get("mileage") or 0
+                    try:
+                        m_int = int(str(m).replace(" ","").replace("км","").strip() or 0)
+                        if m_int>0 and not any(abs(x.get("Probeg",0)-m_int)<100 for x in combined["probeg"] if isinstance(x, dict)):
+                            combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"Авито {off.get('city','')} {off.get('price','')}₽ {off.get('plate','') or off.get('gosnumber','')}"})
+                    except: pass
         except Exception as e:
             logs.append(f"offerbyvin parse err {e}")
 
-        # 2. eaisto - пробег с подписью источника - robust
         try:
             ea_raw = combined["raw"].get("eaisto",{}).get("result",{})
             ea_inner = ea_raw.get("eaisto") or ea_raw.get("result") or ea_raw
             if isinstance(ea_inner, dict):
                 cards = ea_inner.get("cards") or ea_inner.get("list") or ea_inner.get("result") or []
-                if isinstance(cards, list) and len(cards)>0:
+                if isinstance(cards, list):
                     for c in cards[:10]:
-                        if not isinstance(c, dict):
-                            continue
-                        d_raw = c.get("date") or c.get("issueDate") or c.get("validFrom") or c.get("from") or ""
-                        d = parse_eaisto_date(d_raw)
-                        m = c.get("mileage") or c.get("odometer") or c.get("probeg") or 0
+                        if not isinstance(c, dict): continue
+                        d = parse_eaisto_date(c.get("date") or c.get("issueDate") or "")
+                        m = c.get("mileage") or 0
                         try:
-                            m_int = int(str(m).replace(" ","").replace("км","") or 0)
+                            m_int = int(str(m).replace(" ","") or 0)
                             if m_int>0:
-                                combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"ЕАИСТО ТО {c.get('operator','')}"})
-                                ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": c.get("operator",""), "validTo": parse_eaisto_date(c.get("validTo",""))})
-                        except:
-                            pass
-                else:
-                    # одиночная запись
-                    d_raw = ea_inner.get("date") or ea_inner.get("issueDate") or ea_inner.get("from") or ""
-                    d = parse_eaisto_date(d_raw)
-                    m = ea_inner.get("mileage") or ea_inner.get("probeg") or ea_inner.get("odometer") or 0
-                    try:
-                        m_int = int(str(m).replace(" ","") or 0)
-                        if m_int>0:
-                            combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": "ЕАИСТО ТО"})
-                            ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": ea_inner.get("operator","")})
-                    except:
-                        pass
+                                combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"ЕАИСТО ТО {c.get('operator','')} {c.get('gosnumber','')}"})
+                                ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": c.get("operator","")})
+                        except: pass
         except Exception as e:
             logs.append(f"eaisto parse err {e}")
 
-        # 1. carsharing и taxi
-        for src in ["carsharing", "taxi"]:
+        try:
+            sm_raw = combined["raw"].get("servicemaintenance",{}).get("result",{})
+            sm_inner = sm_raw.get("servicemaintenance") or sm_raw.get("result") or sm_raw
+            records = []
+            if isinstance(sm_inner, dict):
+                if isinstance(sm_inner.get("list"), list): records = sm_inner.get("list")
+                elif isinstance(sm_inner.get("records"), list): records = sm_inner.get("records")
+                elif isinstance(sm_inner.get("result"), list): records = sm_inner.get("result")
+            elif isinstance(sm_inner, list):
+                records = sm_inner
+            norm_sm = []
+            for rec in records[:30]:
+                if not isinstance(rec, dict): continue
+                d = parse_eaisto_date(rec.get("date") or rec.get("serviceDate") or "")
+                m = rec.get("mileage") or rec.get("odometer") or 0
+                try: m_int = int(str(m).replace(" ","") or 0)
+                except: m_int = 0
+                works = rec.get("works") or rec.get("workList") or []
+                if isinstance(works, list):
+                    works_str = ", ".join([str(w.get("name") or w)[:80] for w in works[:5]])
+                else:
+                    works_str = str(works)[:200]
+                dealer = rec.get("dealer") or rec.get("service") or ""
+                if m_int>0:
+                    combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"Дилер ТО {dealer} {rec.get('gosnumber','')}"})
+                norm_sm.append({"date": str(d), "mileage": m_int, "dealer": str(dealer)[:60], "works": works_str})
+            ah["service"]["records"] = norm_sm
+            ah["service"]["count"] = len(norm_sm)
+        except Exception as e:
+            logs.append(f"servicemaintenance parse err {e}")
+
+        for src in ["carsharing","taxi"]:
             try:
                 raw_src = combined["raw"].get(src,{}).get("result",{})
                 inner = raw_src.get(src) or raw_src.get("result") or raw_src
                 if isinstance(inner, dict):
-                    cnt = inner.get("count") or inner.get("total") or len(inner.get("list",[]))
                     lst = inner.get("list") or inner.get("items") or []
-                    ah[src]["count"] = cnt if isinstance(cnt, int) else len(lst) if isinstance(lst, list) else 0
+                    cnt = inner.get("count") or (len(lst) if isinstance(lst, list) else 0)
+                    ah[src]["count"] = cnt if isinstance(cnt, int) else 0
                     ah[src]["list"] = lst if isinstance(lst, list) else []
-                    if cnt and cnt>0:
-                        logs.append(f"{src} FOUND {cnt}")
                 elif isinstance(inner, list):
                     ah[src]["count"] = len(inner)
                     ah[src]["list"] = inner
             except Exception as e:
                 logs.append(f"{src} parse err {e}")
 
-        # 3. osago целиком
         try:
             os_raw = combined["raw"].get("osago",{}).get("result",{})
             os_inner = os_raw.get("osago") or os_raw.get("result") or os_raw
             if isinstance(os_inner, dict):
-                pols = os_inner.get("policies") or os_inner.get("list") or os_inner.get("result") or []
-                if isinstance(pols, list):
-                    ah["osago"]["policies"] = pols
-                elif isinstance(os_inner, list):
-                    ah["osago"]["policies"] = os_inner
+                pols = os_inner.get("policies") or os_inner.get("list") or []
+                if isinstance(pols, list): ah["osago"]["policies"] = pols
             elif isinstance(os_inner, list):
                 ah["osago"]["policies"] = os_inner
-        except Exception as e:
-            logs.append(f"osago parse err {e}")
+        except: pass
 
-        # 4. zalog целиком
         try:
             zalog_raw = combined["raw"].get("zalog",{}).get("result",{})
             zalog_inner = zalog_raw.get("zalog") or zalog_raw
             if isinstance(zalog_inner, dict):
-                cnt = zalog_inner.get("count") or len(zalog_inner.get("list",[]))
-                lst = zalog_inner.get("list") or zalog_inner.get("items") or []
+                lst = zalog_inner.get("list") or []
+                cnt = zalog_inner.get("count") or len(lst)
                 ah["zalog"]["count"] = cnt if isinstance(cnt, int) else 0
                 ah["zalog"]["details"] = lst if isinstance(lst, list) else []
-                if cnt == 0:
-                    ah["juridical"]["залог_фнп"] = "Не найден"
-                elif cnt>0:
-                    ah["juridical"]["залог_фнп"] = f"Найдено {cnt} записей"
-                else:
-                    ah["juridical"]["залог_фнп"] = "Нет данных"
-            else:
-                ah["juridical"]["залог_фнп"] = "Нет данных"
-        except:
-            pass
-
-        if not ah.get("pts"):
-            ah["pts"] = "Нет данных в базах"
-        if not ah.get("sts"):
-            ah["sts"] = "Нет данных в базах"
-        if not ah.get("model") or ah.get("model") == f"Авто {vin[:8]}":
-            # fallback по WMI - первые 3 символа VIN
-            wmi = vin[:3].upper()
-            wmi_map = {
-                "WF0": "FORD", "WFO": "FORD", "W0L": "OPEL", "W0V": "OPEL", "WBA": "BMW", "WBS": "BMW", "WDB": "MERCEDES", "WDC": "MERCEDES",
-                "ZAM": "MASERATI", "ZFA": "FIAT", "ZFF": "FERRARI", "WVW": "VOLKSWAGEN", "WAU": "AUDI", "TRU": "AUDI",
-                "TMB": "SKODA", "VSS": "SEAT", "1HG": "HONDA", "2HG": "HONDA", "JHM": "HONDA", "JT": "TOYOTA", "VF": "RENAULT/PEUGEOT/CITROEN"
-            }
-            brand_fallback = wmi_map.get(wmi, "")
-            # попробуем вытащить модель из vindecode raw даже если парсинг не сработал - ищем слова
-            raw_str = str(combined["raw"].get("vindecode",{}))[:5000]
-            # если в raw есть "FUSION" или "FOCUS" и тд
-            import re as _re
-            m = _re.search(r'"model"\s*:\s*"([^"]+)"', raw_str, _re.IGNORECASE)
-            model_fallback = m.group(1) if m else ""
-            m2 = _re.search(r'"brand"\s*:\s*"([^"]+)"', raw_str, _re.IGNORECASE)
-            brand_fallback2 = m2.group(1) if m2 else brand_fallback
-            if brand_fallback2 or model_fallback:
-                ah["model"] = f"{brand_fallback2} {model_fallback}".strip() or ah.get("model")
-            else:
-                ah["model"] = f"Авто {vin[:8]} ({brand_fallback})" if brand_fallback else f"Авто {vin[:8]}"
-            logs.append(f"vindecode fallback used: wmi {wmi} -> {ah['model']} raw snippet {raw_str[:200]}")
-        if not ah.get("color"):
-            ah["color"] = "Нет данных"
-        if not ah.get("engine_vol"):
-            ah["engine_vol"] = "Нет данных"
-        if not ah.get("type"):
-            ah["type"] = "Легковой"
+                ah["juridical"]["залог_фнп"] = f"Найдено {cnt}" if cnt and cnt>0 else "Не найден"
+        except: pass
 
     except Exception as e:
-        logs.append(f"enrich FULL err {e} {__import__('traceback').format_exc()[:500]}")
+        logs.append(f"enrich err {e}")
 
-    global LAST_REPORT_DATA
-    LAST_REPORT_DATA = combined
     return combined
 
-
 def generate_history_html(target, data):
-    """v62 FULL - NO HARDCODE - все 9 источников"""
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
     b1 = data.get("block1_pic",[])
-    b2 = data.get("block2_nomerogram",[])
-    b3 = data.get("block3_autophoto",[])
     probeg = data.get("probeg",[])
     all_b64 = data.get("all_b64",[])
     logs = data.get("logs",[])
@@ -767,325 +969,13 @@ def generate_history_html(target, data):
 
     vin = meta.get("vin") or auto.get("vin") or target
     reg = meta.get("reg") or auto.get("gos") or "не указан"
-    if reg in ["", "не указан"] and auto.get("gos"):
-        reg = auto.get("gos")
-
-    model_full = auto.get("model") or f"Авто {vin[:8]}"
-    year = auto.get("year") or meta.get("year") or "—"
-    color = auto.get("color") or "Нет данных"
-    color_upper = str(color).upper() if color != "Нет данных" else str(year)
-    pts = auto.get("pts") or "Нет данных в базах"
-    sts = auto.get("sts") or "Нет данных в базах"
-    engine_code = auto.get("engine_code") or ""
-    engine_vol = auto.get("engine_vol") or "Нет данных"
-    gearbox = auto.get("gearbox") or "Нет данных"
-    owners = auto.get("owners", 0)
-    body_type = auto.get("type") or "Легковой"
-
-    probeg_sorted = []
-    skrutka = None
-    try:
-        def parse_date(s):
-            import re as re2
-            try:
-                # timestamp int or string like 1655510400
-                if isinstance(s, int):
-                    return datetime.fromtimestamp(s)
-                s_str = str(s).strip()
-                if s_str.isdigit() and len(s_str) == 10:
-                    try:
-                        return datetime.fromtimestamp(int(s_str))
-                    except:
-                        pass
-                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"]:
-                    try:
-                        return datetime.strptime(s_str[:19], fmt)
-                    except:
-                        pass
-                m = re2.search(r'(\d{2})\.(\d{2})\.(\d{4})', s_str)
-                if m:
-                    return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
-                m2 = re2.search(r'(\d{4})-(\d{2})-(\d{2})', s_str)
-                if m2:
-                    return datetime.strptime(f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}", "%Y-%m-%d")
-                # try unix timestamp inside string
-                m3 = re2.search(r'(\d{10})', s_str)
-                if m3:
-                    try:
-                        return datetime.fromtimestamp(int(m3.group(1)))
-                    except:
-                        pass
-            except:
-                pass
-            return datetime.min
-        tmp = []
-        for it in probeg:
-            if isinstance(it, dict) and it.get("Probeg") is not None:
-                d = it.get("DateString","")
-                try:
-                    p = int(it.get("Probeg",0) or 0)
-                except:
-                    continue
-                if p <= 0:
-                    continue
-                tmp.append((parse_date(d), d, p, it.get("Source","")))
-        tmp.sort(key=lambda x: x[0])
-        probeg_sorted = tmp
-        for i in range(1, len(tmp)):
-            if tmp[i][2] < tmp[i-1][2] - 3000:
-                skrutka = {"diff": tmp[i-1][2]-tmp[i][2], "date": tmp[i][1][:10], "prev_date": tmp[i-1][1][:10], "prev": tmp[i-1][2], "cur": tmp[i][2]}
-                break
-    except Exception as e:
-        logs.append(f"probeg sort err {e}")
-        probeg_sorted = []
-
-    dtp_list = auto.get("dtp",[]) or []
-    dtp_count = auto.get("dtp_count", len(dtp_list))
-    total_photos = len(all_b64)
-    all_photos = b1 + b2 + b3
-
-    if skrutka:
-        skrutka_badge = f"СКРУТКА НАЙДЕНА • -{skrutka['diff']} КМ"
-    else:
-        if len(probeg_sorted) >= 2:
-            skrutka_badge = "СКРУТКА НЕ НАЙДЕНА"
-        else:
-            skrutka_badge = f"ПРОБЕГ {len(probeg_sorted)} ЗАПИСЕЙ"
-
-    offers = raw.get("offerbyvin_parsed") or auto.get("offerbyvin_full",{}).get("offers") or []
-    if not offers:
-        try:
-            ob_raw = raw.get("offerbyvin",{}).get("result",{})
-            ob = ob_raw.get("offerbyvin") or ob_raw.get("result") or ob_raw
-            if isinstance(ob, dict) and isinstance(ob.get("offers"), list):
-                offers = ob.get("offers")
-        except:
-            offers = []
-
-    # commercial badges
-    taxi_count = auto.get("taxi",{}).get("count",0)
-    carsharing_count = auto.get("carsharing",{}).get("count",0)
-
-    graph_svg = ""
-    graph_dates = ""
-    if probeg_sorted:
-        try:
-            vals = [p[2] for p in probeg_sorted[-7:]]
-            # use human readable dates for graph
-            def human_date_for_graph(d_str):
-                try:
-                    # if timestamp, convert
-                    s = str(d_str).strip()
-                    if s.isdigit() and len(s)==10:
-                        return datetime.fromtimestamp(int(s)).strftime("%d.%m")
-                    # try parse
-                    import re as _re
-                    m = _re.search(r'(\d{2})\.(\d{2})\.(\d{4})', s)
-                    if m:
-                        return f"{m.group(1)}.{m.group(2)}"
-                    return s[:5]
-                except:
-                    return str(d_str)[:5]
-            dates = [human_date_for_graph(p[1]) for p in probeg_sorted[-7:]]
-            max_v = max(vals) if vals else 1
-            min_v = min(vals) if vals else 0
-            rng = max_v - min_v or 1
-            points = []
-            for idx, v in enumerate(vals):
-                x = 20 + idx * (280 / max(1, len(vals)-1))
-                y = 80 - ((v - min_v) / rng) * 60
-                points.append((x, y))
-            path_d = f"M {points[0][0]} {points[0][1]}"
-            for (x,y) in points[1:]:
-                path_d += f" L {x} {y}"
-            circles = "".join([f'<circle cx="{x}" cy="{y}" r="5" fill="#fff" stroke="#111" stroke-width="2"/>' for (x,y) in points])
-            graph_svg = f'<svg viewBox="0 0 320 100" style="width:100%;height:90px"><path d="{path_d}" fill="none" stroke="#111" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>{circles}</svg>'
-            graph_dates = "".join([f'<span style="margin-right:6px">{d}</span>' for d in dates])
-        except Exception as e:
-            logs.append(f"graph err {e}")
-            graph_svg = '<div style="font-size:12px;color:#8e8e93;padding:20px;text-align:center">Нет данных для графика</div>'
-    else:
-        graph_svg = '<div style="font-size:12px;color:#8e8e93;padding:20px;text-align:center">Нет записей пробега в базах</div>'
-
-    # build photos html safely without nested f-string backslash
-    photos_html = ""
-    if all_photos:
-        parts = []
-        for it in all_photos[:9]:
-            b64 = it.get("b64","")
-            img_tag = ""
-            if b64:
-                img_tag = '<img src="' + b64 + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0.9" />'
-            t = it.get("type","Фото")[:20]
-            d = (it.get("date","")[:10] or "—")
-            parts.append('<div class="photo-cell"><div style="font-size:11px;color:#6b7280;z-index:1">' + t + '</div><span class="year">' + d + '</span>' + img_tag + '</div>')
-        photos_html = "".join(parts)
-    else:
-        photos_html = '<div style="grid-column:1/-1;padding:20px;text-align:center;font-size:12px;color:#8e8e93">Нет фото в базах pic/nomerogram/offerbyvin</div>'
-
-    html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>История {vin} v62 FULL</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}} body{{font-family:Manrope,-apple-system,BlinkMacSystemFont,sans-serif;background:#f2f2f7;color:#111; -webkit-font-smoothing:antialiased}}
-.container{{max-width:440px;margin:0 auto;padding:12px;padding-bottom:40px}}
-.card{{background:#fff;border-radius:24px;padding:18px;border:1px solid #e5e5ea;box-shadow:0 1px 2px rgba(0,0,0,0.04);margin-top:14px}}
-.pill{{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.02em}}
-.pill-red{{background:#ff3b30;color:#fff}} .pill-black{{background:#111;color:#fff}} .pill-green{{background:#34c759;color:#fff}} .pill-gray{{background:#e5e7eb;color:#374151}} .pill-orange{{background:#ff9500;color:#fff}}
-.blue-hero{{background:linear-gradient(180deg,#c7d2fe 0%,#dbeafe 40%,#eff6ff 100%);border-radius:28px;padding:18px;position:relative;overflow:hidden;border:1px solid #bfdbfe}}
-.blue-hero small{{font-size:11px;letter-spacing:0.12em;color:#3b82f6;font-weight:700}}
-.blue-hero h2{{font-size:28px;font-weight:800;color:#1e1b4b;letter-spacing:-0.02em;margin-top:6px;line-height:0.95}}
-.badge-vin{{background:#fff;border:1px solid #dbeafe;color:#2563eb;padding:6px 12px;border-radius:999px;font-size:11px;font-weight:700;display:inline-block;margin-top:10px}}
-.chip-black{{background:#111;color:#fff;border-radius:999px;padding:12px 18px;font-size:14px;font-weight:700;display:inline-flex;align-items:center;gap:8px}}
-.chip-white{{background:#fff;border:1px solid #e5e5ea;color:#111;border-radius:999px;padding:12px 18px;font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:8px}}
-.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
-.info-card{{background:#f8f8fb;border:1px solid #efeff4;border-radius:18px;padding:12px;display:flex;gap:10px;align-items:center}}
-.info-card .ico{{width:36px;height:36px;background:#fff;border:1px solid #e5e5ea;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}}
-.info-card .lbl{{font-size:10px;color:#8e8e93;font-weight:700;letter-spacing:0.08em;text-transform:uppercase}}
-.info-card .val{{font-size:13px;font-weight:700;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}}
-.jur-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}}
-.jur-pill{{background:#fff;border:1px solid #e5e5ea;color:#374151;padding:10px 12px;border-radius:999px;font-size:12px;font-weight:600;display:flex;gap:6px;align-items:center}}
-.jur-pill.ok{{border-color:#d1fae5;color:#065f46}} .jur-pill.bad{{border-color:#fecaca;color:#991b1b}} .jur-pill .dot{{width:18px;height:18px;background:#8e8e93;border-radius:999px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px}} .jur-pill.ok .dot{{background:#34c759}} .jur-pill.bad .dot{{background:#ef4444}}
-.dtp-card{{background:#f8f8fa;border-radius:18px;padding:14px;margin-top:10px;border:1px solid #e5e5ea}}
-.timeline{{margin-top:14px}} .tl-row{{display:flex;gap:12px;position:relative;padding-bottom:18px}} .tl-line{{position:absolute;left:6px;top:14px;bottom:-4px;width:1px;background:#e5e7eb}}
-.tl-dot{{width:12px;height:12px;border-radius:999px;background:#111;border:2px solid #fff;box-shadow:0 0 0 2px #e5e7eb;flex-shrink:0;margin-top:2px;z-index:1}} .tl-dot.red{{background:#ff3b30;box-shadow:0 0 0 4px #fee2e2}} .tl-dot.hl{{background:#111}}
-.tl-content{{flex:1}} .tl-date{{font-weight:700;font-size:14px}} .tl-sub{{font-size:12px;color:#8e8e93;margin-top:2px}}
-.skrutka-pill{{display:inline-flex;background:#ffeaea;color:#ff3b30;border:1px solid #ffcccc;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;margin-left:8px}}
-.graph-wrap{{background:#fff;border:1px solid #e5e5ea;border-radius:20px;padding:12px;margin-top:12px}}
-.photo-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}}
-.photo-cell{{background:#f1f1f3;border-radius:16px;aspect-ratio:1;position:relative;overflow:hidden;border:1px solid #e5e5ea;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:8px;text-align:center}}
-.photo-cell .year{{position:absolute;bottom:8px;left:8px;background:#111;color:#fff;font-size:11px;font-weight:700;padding:4px 8px;border-radius:999px}}
-.log{{font-family:monospace;font-size:9px;background:#f8f8fb;padding:10px;border-radius:12px;overflow:auto;max-height:120px;white-space:pre-wrap;color:#8e8e93;border:1px solid #efeff4}}
-</style></head>
-<body><div class="container">
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-  <span class="pill {'pill-red' if skrutka else 'pill-gray'}">{skrutka_badge}</span>
-  <span class="pill pill-black">ДТП {dtp_count}</span>
-  <span class="pill {'pill-orange' if taxi_count>0 else 'pill-gray'}">ТАКСИ {taxi_count}</span>
-  <span class="pill {'pill-orange' if carsharing_count>0 else 'pill-gray'}">КАРШЕРИНГ {carsharing_count}</span>
-  <span class="pill pill-gray">ЮРИДИКА: {auto.get('juridical',{}).get('залог_фнп','Проверка')[:20]}</span>
-</div>
-<div class="blue-hero" style="margin-top:12px">
-  <small>{body_type} • {year}</small>
-  <h2>{color_upper}</h2>
-  <span class="badge-vin">VIN • {vin}</span>
-  <div style="margin-top:18px">
-    <div style="font-size:22px;font-weight:800;letter-spacing:-0.02em;line-height:1">{model_full}</div>
-    <div style="font-size:14px;color:#6b7280;font-weight:600;margin-top:4px">{engine_vol} • {gearbox} • {color}</div>
-  </div>
-  <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
-    <span class="chip-black"># {reg}</span>
-    <span class="chip-white">👥 {owners} владельца • {len(offers)} объявлений</span>
-  </div>
-</div>
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <div style="font-weight:800;letter-spacing:0.08em;font-size:12px">СВЕДЕНИЯ • ПТС (РЕАЛЬНЫЕ ДАННЫЕ)</div>
-    <span class="pill" style="background:#f2f2f7;color:#6b7280;font-size:10px">Из баз</span>
-  </div>
-  <div class="grid2">
-    <div class="info-card"><div class="ico">#</div><div><div class="lbl">VIN</div><div class="val">{vin[:13]}...</div></div></div>
-    <div class="info-card"><div class="ico">🚗</div><div><div class="lbl">ГОСНОМЕР</div><div class="val">{reg}</div></div></div>
-    <div class="info-card"><div class="ico">📄</div><div><div class="lbl">ПТС</div><div class="val">{pts[:22]}</div></div></div>
-    <div class="info-card"><div class="ico">📄</div><div><div class="lbl">СТС</div><div class="val">{sts[:22]}</div></div></div>
-    <div class="info-card"><div class="ico">🔧</div><div><div class="lbl">ДВИГАТЕЛЬ</div><div class="val">{engine_code or engine_vol[:18]}</div></div></div>
-    <div class="info-card"><div class="ico">⚙️</div><div><div class="lbl">КПП</div><div class="val">{gearbox[:18]}</div></div></div>
-    <div class="info-card"><div class="ico">🎨</div><div><div class="lbl">ЦВЕТ</div><div class="val">{color[:18]}</div></div></div>
-    <div class="info-card"><div class="ico">📅</div><div><div class="lbl">ГОД</div><div class="val">{year}</div></div></div>
-  </div>
-  <div style="font-size:10px;color:#8e8e93;margin-top:10px">Источники: vindecode, gibdd, offerbyvin, eaisto. "Нет данных" = база не вернула.</div>
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">✅ ЮРИДИКА (РЕАЛЬНЫЕ ПРОВЕРКИ)</div>
-  <div class="jur-grid">
-    <div class="jur-pill"><span class="dot">✓</span> Ограничений: {auto.get('juridical',{}).get('ограничения','Нет данных')[:30]}</div>
-    <div class="jur-pill"><span class="dot">✓</span> Розыск: {auto.get('juridical',{}).get('розыск','Нет данных')[:20]}</div>
-    <div class="jur-pill"><span class="dot">✓</span> Залог: {auto.get('juridical',{}).get('залог_фнп','Нет данных')[:30]}</div>
-    <div class="jur-pill"><span class="dot">✓</span> Лизинг: {auto.get('juridical',{}).get('лизинг','Нет данных')[:20]}</div>
-  </div>
-  <div style="margin-top:10px">
-    <div style="font-size:11px;font-weight:700;margin-top:8px">ЗАЛОГ ДЕТАЛИ ({len(auto.get('zalog',{}).get('details',[]))}):</div>
-    {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0;border-bottom:1px solid #f2f2f7">{d.get("bank","")} • {d.get("date","")} • {d.get("type","")}</div>' for d in auto.get('zalog',{}).get('details',[])[:3]]) if auto.get('zalog',{}).get('details') else '<div style="font-size:11px;color:#6b7280">Залог не найден</div>'}
-    <div style="font-size:11px;font-weight:700;margin-top:8px">ОСАГО ({len(auto.get('osago',{}).get('policies',[]))}):</div>
-    {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0;border-bottom:1px solid #f2f2f7">{p.get("company","")} • {p.get("date","")} • {p.get("period","")}</div>' for p in auto.get('osago',{}).get('policies',[])[:3]]) if auto.get('osago',{}).get('policies') else '<div style="font-size:11px;color:#6b7280">Нет данных ОСАГО</div>'}
-    <div style="font-size:11px;font-weight:700;margin-top:8px">ГИБДД РЕГ ИСТОРИЯ ({len(auto.get('gibdd',{}).get('reg_history',[]))}):</div>
-    {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0;border-bottom:1px solid #f2f2f7">{r.get("date","")} • {r.get("region","")} • {r.get("type","")}</div>' for r in auto.get('gibdd',{}).get('reg_history',[])[:3]]) if auto.get('gibdd',{}).get('reg_history') else '<div style="font-size:11px;color:#6b7280">Нет истории ГИБДД (gibdd 404 - иномарка)</div>'}
-  </div>
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">⚠️ ДТП • {dtp_count} СЛУЧАЯ (ИЗ БАЗЫ dtp - ЦЕЛИКОМ)</div>
-  {''.join([f'<div class="dtp-card"><div style="font-weight:800">{d.get("date","")} • {d.get("type","")}</div><div style="font-size:12px;color:#6b7280">{d.get("region","")} • Ущерб: {d.get("damage","")} {d.get("cost","")}</div><div style="font-size:11px;color:#8e8e93;margin-top:4px">Повреждено: {", ".join(d.get("damagePoints",[])[:5]) if d.get("damagePoints") else "нет деталей"}</div></div>' for d in dtp_list]) if dtp_list else '<div style="font-size:12px;color:#6b7280;margin-top:10px;padding:12px;background:#f8f8fb;border-radius:12px">ДТП не найдено в базе dtp</div>'}
-</div>
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">📈 ПРОБЕГ • ТАЙМЛАЙН (probeg2 + offerbyvin + eaisto) С ПОДПИСЬЮ ИСТОЧНИКА</div>
-    <span class="pill pill-black">~{max([p[2] for p in probeg_sorted], default=0)//1000}к макс</span>
-  </div>
-  {f'<div style="background:#ffeaea;border:1px solid #ffcccc;color:#ff3b30;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:700;margin-top:10px">Скрутка {skrutka["diff"]} км {skrutka["prev_date"]} {skrutka["prev"]} → {skrutka["date"]} {skrutka["cur"]}</div>' if skrutka else ''}
-  <div class="graph-wrap">
-    {graph_svg}
-    <div style="display:flex;justify-content:space-between;font-size:10px;color:#8e8e93;margin-top:6px;gap:4px;flex-wrap:wrap">{graph_dates}</div>
-  </div>
-  <div class="timeline">
-    {''.join([f'<div class="tl-row"><div class="tl-line"></div><div class="tl-dot red"></div><div class="tl-content"><div class="tl-date">{d[1][:10]} • {d[2]} км</div><div class="tl-sub">{d[3]}</div></div></div>'.replace(',', ' ') for d in reversed(probeg_sorted[-15:])]) if probeg_sorted else '<div style="font-size:12px;color:#6b7280;padding:12px">Нет записей пробега</div>'}
-  </div>
-  <div style="margin-top:10px">
-    <div style="font-size:11px;font-weight:700">ЕАИСТО ДИАГНОСТИЧЕСКИЕ КАРТЫ ({len(auto.get('eaisto',{}).get('cards',[]))}):</div>
-    {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0;border-bottom:1px solid #f2f2f7">{c.get("date","")} • {c.get("mileage","")} км • {c.get("operator","")}</div>' for c in auto.get('eaisto',{}).get('cards',[])[:5]]) if auto.get('eaisto',{}).get('cards') else '<div style="font-size:11px;color:#6b7280">Нет карт ЕАИСТО</div>'}
-  </div>
-</div>
-<div class="card">
-  <div style="display:flex;justify-content:space-between">
-    <div style="font-weight:800;font-size:13px">📸 ФОТО • {total_photos} ШТ (РЕАЛЬНЫЕ)</div>
-    <div style="font-size:11px;color:#8e8e93">VIN {len(b1)} • Номерограм {len(b2)} • Автофото {len(b3)}</div>
-  </div>
-  <div class="photo-grid">
-    {photos_html}
-  </div>
-  <div style="margin-top:10px">
-    <div style="font-size:11px;font-weight:700">НОМЕРОГРАМ ОБЪЯВЛЕНИЯ ({len(auto.get('nomerogram_full',{}).get('ads',[]))}):</div>
-    {''.join([f'<div style="font-size:11px;color:#6b7280;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>{a.get("date","")} • {a.get("price","")} • {a.get("mileage","")} км</b><br>{a.get("title","")[:80]}<br>{a.get("text","")[:120]}</div>' for a in auto.get('nomerogram_full',{}).get('ads',[])[:3]]) if auto.get('nomerogram_full',{}).get('ads') else '<div style="font-size:11px;color:#6b7280">Нет объявлений номерограм</div>'}
-  </div>
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">🏷️ ИСТОРИЯ ПРОДАЖ • {len(offers)} ОБЪЯВЛЕНИЙ (offerbyvin - ЦЕЛИКОМ)</div>
-  {''.join([f'<div style="background:#f8f8fb;border-radius:14px;padding:12px;margin-top:8px"><div style="font-weight:700;font-size:13px">{off.get("date","")} • {off.get("mileage","—")} км • {off.get("price","—")} ₽ • {off.get("city","")}</div><div style="font-size:11px;color:#6b7280;margin-top:4px">Гос {off.get("plate","")} • ПТС {off.get("ptsNumber","")[:20]} • {off.get("source","Авито")}<br>{off.get("description","")[:120] if off.get("description") else ""}</div></div>' for off in offers[:5]]) if offers else '<div style="font-size:12px;color:#6b7280;margin-top:8px">Объявлений не найдено в offerbyvin</div>'}
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">🚕 КОММЕРЦИЯ - ТАКСИ И КАРШЕРИНГ (ЦЕЛИКОМ)</div>
-  <div style="font-size:11px;margin-top:8px">Такси: {taxi_count} записей</div>
-  {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0">{t.get("date","")} • {t.get("company","")} • {t.get("license","")}</div>' for t in auto.get('taxi',{}).get('list',[])[:3]]) if auto.get('taxi',{}).get('list') else '<div style="font-size:11px;color:#6b7280">Не работала в такси (по базе)</div>'}
-  <div style="font-size:11px;margin-top:8px">Каршеринг: {carsharing_count} записей</div>
-  {''.join([f'<div style="font-size:11px;color:#6b7280;padding:4px 0">{c.get("date","")} • {c.get("company","")}</div>' for c in auto.get('carsharing',{}).get('list',[])[:3]]) if auto.get('carsharing',{}).get('list') else '<div style="font-size:11px;color:#6b7280">Не работала в каршеринге</div>'}
-</div>
-<div class="card">
-  <div style="font-size:10px;letter-spacing:0.12em;color:#8e8e93;font-weight:700">ЛОГИ ОТЛАДКИ (РЕАЛЬНЫЕ ЗАПРОСЫ)</div>
-  <div class="log">{"<br>".join(logs[-25:])}</div>
-  <div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">РЕАЛЬНЫЕ ДАННЫЕ ИЗ БАЗ • БЕЗ ХАРДКОДОВ • v62 FULL 9 SOURCES • {reg} • {vin}</div>
-</div>
-</div></body></html>"""
-    return html
-
-def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
-    """v62 FULL - только реальные данные, без хардкодов, все 9 источников"""
-    meta = data.get("meta",{})
-    auto = data.get("autoteka_hard",{})
-    b1 = data.get("block1_pic",[])
-    b2 = data.get("block2_nomerogram",[])
-    b3 = data.get("block3_autophoto",[])
-    probeg = data.get("probeg",[])
-    all_b64 = data.get("all_b64",[])
-    logs = data.get("logs",[])
-    raw = data.get("raw",{})
-    vin = meta.get("vin") or auto.get("vin") or ""
-    
-    reg = meta.get("reg") or auto.get("gos") or "не указан"
-    model_full = auto.get("model") or f"Авто {vin[:8]}"
-    year = auto.get("year") or meta.get("year") or "—"
-    color = auto.get("color") or "Нет данных"
-    pts = auto.get("pts") or "Нет данных"
-    engine_vol = auto.get("engine_vol") or "Нет данных"
-    gearbox = auto.get("gearbox") or "Нет данных"
+    current_gos = meta.get("current_gos") or reg
+    all_gos = meta.get("all_gos_found",[])
+    model_full = html_lib.escape(auto.get("model") or f"Авто {vin[:8]}")
+    year = html_lib.escape(str(auto.get("year") or meta.get("year") or "—"))
+    color = html_lib.escape(str(auto.get("color") or "Нет данных"))
+    engine_vol = html_lib.escape(str(auto.get("engine_vol") or "Нет данных"))
+    gearbox = html_lib.escape(str(auto.get("gearbox") or "Нет данных"))
     owners = auto.get("owners", 0)
     dtp_list = auto.get("dtp",[]) or []
     dtp_count = auto.get("dtp_count", len(dtp_list))
@@ -1094,563 +984,324 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
     probeg_sorted = []
     skrutka = None
     try:
-        def parse_date(s):
-            import re as re2
-            try:
-                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d"]:
-                    try:
-                        return datetime.strptime(str(s).strip()[:19], fmt)
-                    except:
-                        pass
-                m = re2.search(r'(\d{2})\.(\d{2})\.(\d{4})', str(s))
-                if m:
-                    return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
-            except:
-                pass
-            return datetime.min
+        def parse_sort(s):
+            try: return datetime.strptime(str(s)[:10], "%d.%m.%Y")
+            except: return datetime.min
         tmp = []
         for it in probeg:
-            if isinstance(it, dict) and it.get("Probeg") is not None:
-                try:
-                    p = int(it.get("Probeg",0) or 0)
-                except:
-                    continue
-                if p<=0:
-                    continue
+            if isinstance(it, dict) and it.get("Probeg"):
+                try: p = int(it.get("Probeg",0) or 0)
+                except: continue
+                if p<=0: continue
                 d = it.get("DateString","")
-                tmp.append((parse_date(d), d, p, it.get("Source","")))
+                tmp.append((parse_sort(d), d, p, it.get("Source","")))
         tmp.sort(key=lambda x: x[0])
         probeg_sorted = tmp
         for i in range(1, len(tmp)):
-            if tmp[i][2] < tmp[i-1][2] - 3000:
+            if tmp[i][2] < tmp[i-1][2] - 500:
                 skrutka = {"diff": tmp[i-1][2]-tmp[i][2], "date": tmp[i][1][:10], "prev_date": tmp[i-1][1][:10], "prev": tmp[i-1][2], "cur": tmp[i][2]}
                 break
     except:
         probeg_sorted = []
 
-    import html as html_lib
-    def format_ai(text):
-        if not text:
-            return ""
-        esc = html_lib.escape(text)
-        import re
-        esc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', esc)
-        esc = esc.replace('\n', '<br>')
-        return esc
-
-    verdict_title = "АНАЛИЗ НА ОСНОВЕ РЕАЛЬНЫХ ДАННЫХ"
-    verdict_color = "#111"
-    verdict_emoji = "🧠"
-    if ai_text:
-        if "НЕ ЕХАТЬ" in ai_text or "НЕ БРАТЬ" in ai_text:
-            verdict_title = "НЕ ЕХАТЬ — РИСКИ ВЫЯВЛЕНЫ"
-            verdict_color = "#ff3b30"
-            verdict_emoji = "⛔"
-        elif "ЕХАТЬ" in ai_text and "ОСТОРОЖНО" in ai_text:
-            verdict_title = "ЕХАТЬ ОСТОРОЖНО — ЕСТЬ РИСКИ"
-            verdict_color = "#ff9500"
-            verdict_emoji = "⚠️"
-        elif "ЕХАТЬ" in ai_text:
-            verdict_title = "МОЖНО ЕХАТЬ — РИСКИ МИНИМАЛЬНЫ"
-            verdict_color = "#34c759"
-            verdict_emoji = "✅"
-    else:
-        if skrutka:
-            verdict_title = f"СКРУТКА {skrutka['diff']} КМ + {dtp_count} ДТП"
-            verdict_color = "#ff3b30"
-            verdict_emoji = "⛔"
-        elif dtp_count > 0:
-            verdict_title = f"{dtp_count} ДТП — ПРОВЕРИТЬ КУЗОВ"
-            verdict_color = "#ff9500"
-            verdict_emoji = "⚠️"
-        else:
-            verdict_title = "ДАННЫЕ ИЗ БАЗ — ПРОВЕРЬТЕ КУЗОВ"
-            verdict_color = "#111"
-            verdict_emoji = "🔍"
-
-    ai_block_html = ""
-    if ai_text:
-        ai_block_html = f'<div style="background:#111;color:#fff;border-radius:20px;padding:16px;margin-top:12px"><div style="font-size:11px;letter-spacing:0.08em;opacity:0.6">🧠 ВЕРДИКТ ПОДБОРЩИКА • {OPENROUTER_MODEL} • РЕАЛЬНЫЕ ДАННЫЕ 9 ИСТОЧНИКОВ</div><div style="font-size:13px;line-height:1.5;margin-top:10px;white-space:pre-wrap">{format_ai(ai_text)}</div></div>'
-    elif ai_error:
-        ai_block_html = f'<div style="background:#ffeaea;border:1px solid #ffcccc;color:#8b0000;border-radius:18px;padding:14px;margin-top:12px"><b>⚠️ OpenRouter ошибка:</b> {html_lib.escape(str(ai_error))[:600]}<br><span style="font-size:11px">Покажу анализ на основе реальных данных ниже</span></div>'
-    else:
-        ai_block_html = '<div style="background:#f2f2f7;border-radius:18px;padding:14px;margin-top:12px;font-size:13px">ИИ ключ не настроен — ниже анализ на основе реальных данных из баз</div>'
-
+    skrutka_badge = f"СКРУТКА -{skrutka['diff']} КМ" if skrutka else f"ПРОБЕГ {len(probeg_sorted)} ЗАПИСЕЙ"
     offers = raw.get("offerbyvin_parsed") or auto.get("offerbyvin_full",{}).get("offers") or []
-    if not offers:
-        try:
-            ob_raw = raw.get("offerbyvin",{}).get("result",{})
-            ob = ob_raw.get("offerbyvin") or ob_raw.get("result") or ob_raw
-            if isinstance(ob, dict) and isinstance(ob.get("offers"), list):
-                offers = ob.get("offers")
-        except:
-            offers = []
-
     taxi_count = auto.get("taxi",{}).get("count",0)
     carsharing_count = auto.get("carsharing",{}).get("count",0)
+    service_count = auto.get("service",{}).get("count",0)
+    gai_rest = len(auto.get("gai",{}).get("restrictions",[]))
+    gh_count = auto.get("gibddhistory",{}).get("count",0)
 
-    skrutka_badge = f"СКРУТКА НАЙДЕНА • -{skrutka['diff']} КМ" if skrutka else f"ПРОБЕГ {len(probeg_sorted)} ЗАПИСЕЙ • ~{max([p[2] for p in probeg_sorted], default=0)//1000}к" if probeg_sorted else "НЕТ ДАННЫХ ПРОБЕГА"
+    photos_html = ""
+    if b1:
+        parts = []
+        for it in b1[:MAX_B64_IMAGES]:
+            b64 = it.get("b64","")
+            img_tag = f'<img src="{b64}" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" />' if b64 else ""
+            t = html_lib.escape(it.get("type","Фото")[:20])
+            d = html_lib.escape(it.get("date","")[:10] or "—")
+            parts.append(f'<div class="photo-cell"><div style="font-size:11px;color:#6b7280;z-index:1">{t}</div><span class="year">{d}</span>{img_tag}</div>')
+        photos_html = "".join(parts)
+    else:
+        photos_html = '<div style="grid-column:1/-1;padding:20px;text-align:center;font-size:12px;color:#8e8e93">Нет фото</div>'
 
-    html = f"""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Рекомендации {vin} v62 FULL</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}} body{{font-family:Manrope,-apple-system,BlinkMacSystemFont,sans-serif;background:#f2f2f7;color:#111;-webkit-font-smoothing:antialiased}}
-.container{{max-width:440px;margin:0 auto;padding:12px;padding-bottom:40px}}
-.card{{background:#fff;border-radius:24px;padding:18px;border:1px solid #e5e5ea;box-shadow:0 1px 2px rgba(0,0,0,0.04);margin-top:14px}}
-.pill{{display:inline-flex;align-items:center;padding:8px 14px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.02em}}
-.pill-red{{background:#ff3b30;color:#fff}} .pill-black{{background:#111;color:#fff}} .pill-green{{background:#34c759;color:#fff}} .pill-gray{{background:#e5e7eb;color:#374151}} .pill-orange{{background:#ff9500;color:#fff}}
-.verdict-hero{{background:{verdict_color};border-radius:28px;padding:18px;color:#fff}}
-.verdict-hero h1{{font-size:20px;font-weight:800;line-height:1.1}}
-.verdict-hero .sub{{font-size:11px;opacity:0.85;margin-top:8px;letter-spacing:0.06em}}
-.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
-.info-card{{background:#f8f8fb;border:1px solid #efeff4;border-radius:18px;padding:12px;display:flex;gap:10px;align-items:center}}
-.info-card .ico{{width:36px;height:36px;background:#fff;border:1px solid #e5e5ea;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}}
-.info-card .lbl{{font-size:10px;color:#8e8e93;font-weight:700;letter-spacing:0.08em;text-transform:uppercase}}
-.info-card .val{{font-size:13px;font-weight:700;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}}
-.timeline{{margin-top:14px}} .tl-row{{display:flex;gap:12px;position:relative;padding-bottom:18px}} .tl-line{{position:absolute;left:6px;top:14px;bottom:-4px;width:1px;background:#e5e7eb}}
-.tl-dot{{width:12px;height:12px;border-radius:999px;background:#111;border:2px solid #fff;box-shadow:0 0 0 2px #e5e7eb;flex-shrink:0;margin-top:2px;z-index:1}} .tl-dot.red{{background:#ff3b30;box-shadow:0 0 0 4px #fee2e2}}
-.tl-content{{flex:1}} .tl-date{{font-weight:700;font-size:14px}} .tl-sub{{font-size:12px;color:#8e8e93;margin-top:2px}}
-.check{{background:#f8f8fb;border:1px solid #e5e5ea;border-radius:18px;padding:12px;margin-top:8px;display:flex;gap:10px}} .check .n{{width:24px;height:24px;background:#111;color:#fff;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0}}
-.log{{font-family:monospace;font-size:9px;background:#f8f8fb;padding:10px;border-radius:12px;overflow:auto;max-height:80px;white-space:pre-wrap;color:#8e8e93;border:1px solid #efeff4}}
-</style></head>
-<body><div class="container">
+    safe_logs = "<br>".join([html_lib.escape(str(x)) for x in logs[-35:]])
+
+    service_recs = auto.get("service",{}).get("records",[])[:5]
+    if service_recs:
+        service_html = "".join([f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>{html_lib.escape(s.get("date",""))} • {s.get("mileage","")} км • {html_lib.escape(s.get("dealer","")[:40])}</b><br>{html_lib.escape(s.get("works","")[:120])}</div>' for s in service_recs])
+    else:
+        service_html = '<div style="font-size:11px;color:#6b7280">Нет данных дилерского ТО</div>'
+
+    all_gos_html = "".join([f'<span style="background:#111;color:#fff;border-radius:999px;padding:6px 10px;font-size:10px;margin-right:4px">{html_lib.escape(g)}</span>' for g in all_gos[:6]])
+
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>История {html_lib.escape(vin)} v65.6</title>
+<style>*{{box-sizing:border-box;margin:0;padding:0}} body{{font-family:Manrope,sans-serif;background:#f2f2f7;color:#111}} .container{{max-width:440px;margin:0 auto;padding:12px;padding-bottom:40px}} .card{{background:#fff;border-radius:24px;padding:18px;border:1px solid #e5e5ea;margin-top:14px}} .pill{{display:inline-flex;padding:8px 14px;border-radius:999px;font-size:11px;font-weight:800}} .pill-red{{background:#ff3b30;color:#fff}} .pill-black{{background:#111;color:#fff}} .pill-gray{{background:#e5e7eb;color:#374151}} .pill-orange{{background:#ff9500;color:#fff}} .pill-green{{background:#34c759;color:#fff}} .blue-hero{{background:linear-gradient(180deg,#c7d2fe 0%,#dbeafe 40%,#eff6ff 100%);border-radius:28px;padding:18px;border:1px solid #bfdbfe}} .photo-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}} .photo-cell{{background:#f1f1f3;border-radius:16px;aspect-ratio:1;position:relative;overflow:hidden;border:1px solid #e5e5ea;display:flex;align-items:center;justify-content:center;padding:8px;text-align:center}} .photo-cell .year{{position:absolute;bottom:8px;left:8px;background:#111;color:#fff;font-size:11px;font-weight:700;padding:4px 8px;border-radius:999px}} .log{{font-family:monospace;font-size:9px;background:#f8f8fb;padding:10px;border-radius:12px;overflow:auto;max-height:140px;white-space:pre-wrap;color:#8e8e93;border:1px solid #efeff4}}</style></head><body><div class="container">
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-  <span class="pill {'pill-red' if skrutka else 'pill-gray'}">{skrutka_badge}</span>
-  <span class="pill pill-black">ДТП {dtp_count}</span>
-  <span class="pill {'pill-orange' if taxi_count>0 else 'pill-gray'}">ТАКСИ {taxi_count}</span>
-  <span class="pill {'pill-orange' if carsharing_count>0 else 'pill-gray'}">КАРШЕРИНГ {carsharing_count}</span>
-  <span class="pill pill-gray">ФОТО {total_photos} • ОБЪЯВЛЕНИЙ {len(offers)}</span>
+<span class="pill {'pill-red' if skrutka else 'pill-gray'}">{html_lib.escape(skrutka_badge)}</span>
+<span class="pill pill-black">ДТП {dtp_count}</span>
+<span class="pill {'pill-orange' if taxi_count>0 else 'pill-gray'}">ТАКСИ {taxi_count}</span>
+<span class="pill {'pill-orange' if carsharing_count>0 else 'pill-gray'}">КАРШЕРИНГ {carsharing_count}</span>
+<span class="pill {'pill-green' if service_count>0 else 'pill-gray'}">ТО ДИЛЕР {service_count}</span>
+<span class="pill {'pill-orange' if gai_rest>0 else 'pill-gray'}">GAI {gai_rest} огр.</span>
+<span class="pill pill-gray">КЭШ ГИБДД {gh_count}</span>
+<span class="pill pill-black">ТЕКУЩИЙ {html_lib.escape(current_gos[:12])}</span>
 </div>
-<div class="verdict-hero" style="margin-top:12px">
-  <div style="font-size:11px;letter-spacing:0.12em;opacity:0.8;font-weight:700">КНОПКА 2 • РЕАЛЬНЫЕ ДАННЫЕ 9 ИСТОЧНИКОВ • {OPENROUTER_MODEL}</div>
-  <h1 style="margin-top:10px">{verdict_emoji} {verdict_title}</h1>
-  <div class="sub">VIN {vin} • Гос {reg} • {model_full} • {color} • {owners} владельца • {total_photos} фото • Источники: probeg2, dtp, offerbyvin, eaisto, osago, zalog, gibdd, taxi, carsharing</div>
-  <div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap">
-    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">{engine_vol}</span>
-    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">{gearbox}</span>
-    <span style="background:rgba(255,255,255,0.2);padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700">ПТС {pts[:18]}</span>
-  </div>
+<div class="blue-hero" style="margin-top:12px">
+<h2 style="font-size:24px;font-weight:800">{model_full}</h2>
+<div style="font-size:13px;color:#6b7280;margin-top:4px">{engine_vol} • {gearbox} • {color} • {year}</div>
+<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+<span style="background:#111;color:#fff;border-radius:999px;padding:12px 18px;font-size:14px;font-weight:800"># ТЕКУЩИЙ {html_lib.escape(current_gos)}</span>
+<span style="background:#fff;border:1px solid #e5e5ea;border-radius:999px;padding:10px 16px;font-size:12px">👥 {owners} • {len(offers)} объяв • {service_count} ТО</span>
 </div>
-<div class="card">
-  <div style="font-weight:800;font-size:12px;letter-spacing:0.08em">📋 РИСКИ • ИЗ БАЗ</div>
-  <div class="grid2">
-    <div class="info-card"><div class="ico">🎨</div><div><div class="lbl">КУЗОВ</div><div class="val">{dtp_count} ДТП в базе</div></div></div>
-    <div class="info-card"><div class="ico">⏱️</div><div><div class="lbl">ПРОБЕГ</div><div class="val">{'Скрутка' if skrutka else f'{len(probeg_sorted)} записей'}</div></div></div>
-    <div class="info-card"><div class="ico">⚖️</div><div><div class="lbl">ЮРИДИКА</div><div class="val">{auto.get('juridical',{}).get('залог_фнп','Нет данных')[:16]}</div></div></div>
-    <div class="info-card"><div class="ico">🔧</div><div><div class="lbl">ТЕХНИКА</div><div class="val">{engine_vol[:16]}</div></div></div>
-  </div>
+<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:4px">{all_gos_html}<span style="font-size:10px;color:#6b7280;margin-left:6px">все гос для объявлений ({len(all_gos)})</span></div>
 </div>
-{ai_block_html}
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">📈 ПРОБЕГ • {len(probeg_sorted)} ЗАПИСЕЙ ИЗ БАЗ С ПОДПИСЬЮ ИСТОЧНИКА</div>
-  {f'<div style="background:#ffeaea;border:1px solid #ffcccc;color:#ff3b30;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:700;margin-top:10px">Скрутка {skrutka["diff"]} км {skrutka["prev_date"]} {skrutka["prev"]} → {skrutka["date"]} {skrutka["cur"]}</div>' if skrutka else ''}
-  <div class="timeline">
-    {''.join([f'<div class="tl-row"><div class="tl-line"></div><div class="tl-dot red"></div><div class="tl-content"><div class="tl-date">{d[1][:10]} • {d[2]:,} км</div><div class="tl-sub">{d[3]}</div></div></div>'.replace(',', ' ') for d in reversed(probeg_sorted[-10:])]) if probeg_sorted else '<div style="font-size:12px;color:#6b7280;padding:12px">Нет записей пробега в базах</div>'}
-  </div>
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">⚠️ ДТП • {dtp_count} (РЕАЛЬНЫЕ ДАННЫЕ dtp - ЦЕЛИКОМ)</div>
-  {''.join([f'<div style="background:#f8f8fa;border-radius:14px;padding:12px;margin-top:8px"><div style="font-weight:700">{d.get("date","")} • {d.get("type","")}</div><div style="font-size:11px;color:#6b7280">{d.get("region","")} • {d.get("damage","")} • Повреждено: {", ".join(d.get("damagePoints",[])[:3])}</div></div>' for d in dtp_list]) if dtp_list else '<div style="font-size:12px;color:#6b7280;margin-top:8px">ДТП не найдено в базе</div>'}
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">🏷️ ОБЪЯВЛЕНИЯ • {len(offers)} (offerbyvin — ЦЕЛИКОМ)</div>
-  {''.join([f'<div style="background:#f8f8fb;border-radius:14px;padding:12px;margin-top:8px"><div style="font-weight:700;font-size:13px">{off.get("date","")} • {off.get("mileage","—")} км • {off.get("price","—")} ₽ • {off.get("city","")}</div><div style="font-size:11px;color:#6b7280;margin-top:4px">Гос {off.get("plate","")} • ПТС {off.get("ptsNumber","")[:20]} • {off.get("source","Авито")}<br>{off.get("description","")[:120] if off.get("description") else ""}</div></div>' for off in offers[:5]]) if offers else '<div style="font-size:12px;color:#6b7280;margin-top:8px">Нет объявлений в offerbyvin</div>'}
-</div>
-<div class="card">
-  <div style="font-weight:800;font-size:13px;letter-spacing:0.06em">🚕 КОММЕРЦИЯ - ТАКСИ И КАРШЕРИНГ (ЦЕЛИКОМ)</div>
-  <div style="font-size:11px;margin-top:8px">Такси: {taxi_count} записей - {auto.get('taxi',{}).get('list',[])}</div>
-  <div style="font-size:11px;margin-top:8px">Каршеринг: {carsharing_count} записей</div>
-</div>
-<div class="card">
-  <div style="font-size:10px;letter-spacing:0.12em;color:#8e8e93;font-weight:700">ЛОГИ ОТЛАДКИ • РЕАЛЬНЫЕ ЗАПРОСЫ 9 ИСТОЧНИКОВ</div>
-  <div class="log">{"<br>".join(logs[-20:])}</div>
-  <div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">РЕАЛЬНЫЕ ДАННЫЕ • БЕЗ ХАРДКОДОВ • v62 FULL 9 SOURCES • {reg} • {vin}</div>
-</div>
-</div></body></html>"""
-    return html
 
-def build_prompt_for_openrouter(data):
-    """Собирает промпт из РЕАЛЬНЫХ данных всех 9 баз"""
+<div class="card"><div style="font-weight:800;font-size:12px">🔧 ДИЛЕРСКАЯ ИСТОРИЯ • {service_count} записей</div><div style="margin-top:8px">{service_html}</div></div>
+
+<div class="card"><div style="font-weight:800;font-size:12px">📸 ФОТО {total_photos}</div><div class="photo-grid">{photos_html}</div></div>
+
+<div class="card"><div style="font-weight:800;font-size:12px">📈 ПРОБЕГ {len(probeg_sorted)} записей (все источники)</div>
+{''.join([f'<div style="font-size:12px;padding:6px 0;border-bottom:1px solid #f2f2f7">{html_lib.escape(str(d[1][:10]))} • {d[2]} км • {html_lib.escape(str(d[3])[:60])}</div>' for d in reversed(probeg_sorted[-20:])]) if probeg_sorted else '<div style="font-size:12px;color:#6b7280">Нет записей</div>'}
+</div>
+
+<div class="card"><div class="log">{safe_logs}</div><div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">v65.6 CURRENT GOS={html_lib.escape(current_gos)} ALL={html_lib.escape(",".join(all_gos[:3]))} • {html_lib.escape(vin)}</div></div>
+</div></body></html>"""
+
+def build_prompt_for_openrouter(data: Dict[str, Any]) -> str:
     meta = data.get("meta",{})
     auto = data.get("autoteka_hard",{})
-    probeg = data.get("probeg",[])
+    probeg = data.get("probeg",[])[:25]
     raw = data.get("raw",{})
     vin = meta.get("vin") or ""
     reg = meta.get("reg") or "не указан"
-    b1 = len(data.get("block1_pic",[]))
-    b2 = len(data.get("block2_nomerogram",[]))
-    b3 = len(data.get("block3_autophoto",[]))
-
-    def safe_json(key, limit=4000):
-        try:
-            r = raw.get(key,{}).get("result",{})
-            s = json.dumps(r, ensure_ascii=False, indent=2)
-            return s[:limit]
-        except:
-            return "нет данных"
-
-    vindecode = safe_json("vindecode")
-    probeg_raw = safe_json("probeg2")
-    dtp_raw = safe_json("dtp")
-    zalog_raw = safe_json("zalog", 2000)
-    gibdd_raw = safe_json("gibdd", 2000)
-    eaisto_raw = safe_json("eaisto", 2000)
-    osago_raw = safe_json("osago", 2000)
-    carsharing_raw = safe_json("carsharing", 1500)
-    taxi_raw = safe_json("taxi", 1500)
-    offer_raw = safe_json("offerbyvin", 4000)
-    nomerogram_raw = safe_json("nomerogram", 2000)
-
+    current_gos = meta.get("current_gos") or reg
+    all_gos = meta.get("all_gos_found",[])
+    offers = (raw.get("offerbyvin_parsed") or [])[:7]
     probeg_lines = []
-    try:
-        for p in probeg[-20:]:
-            if isinstance(p, dict):
-                probeg_lines.append(f"{p.get('DateString','?')} — {p.get('Probeg','?')} км — {p.get('Source','?')}")
-    except:
-        pass
-    probeg_human = "\n".join(probeg_lines) or "нет записей пробега в базах"
+    for p in probeg[-20:]:
+        if isinstance(p, dict):
+            probeg_lines.append(f"{p.get('DateString','?')} {p.get('Probeg','?')}км {p.get('Source','')}")
+    probeg_human = "\n".join(probeg_lines) or "нет данных"
+    offers_human = "\n".join([f"{off.get('date','')} {off.get('mileage','')}км {off.get('price','')}₽ {off.get('city','')} {off.get('plate','') or off.get('gosnumber','')}" for off in offers if isinstance(off, dict)]) or "нет объявлений"
+    dtp = auto.get("dtp",[])[:5]
+    dtp_human = "\n".join([f"{d.get('date','')} {d.get('type','')} {d.get('damage','')}" for d in dtp]) or "нет ДТП"
+    service = auto.get("service",{}).get("records",[])[:7]
+    service_human = "\n".join([f"{s.get('date','')} {s.get('mileage','')}км {s.get('dealer','')} {s.get('works','')[:80]}" for s in service]) or "нет дилер ТО"
+    prompt = f"""VIN:{vin} ТЕКУЩИЙ ГОС:{current_gos} ВСЕ ГОС:{",".join(all_gos[:5])} Модель:{auto.get('model')} {auto.get('year')} {auto.get('engine_vol')} {auto.get('color')}
+Владельцев:{auto.get('owners')} ДТП:{auto.get('dtp_count')} Объявлений:{len(offers)} Дилер ТО:{auto.get('service',{}).get('count',0)}
 
-    offers = raw.get("offerbyvin_parsed") or auto.get("offerbyvin_full",{}).get("offers") or []
-    if not offers:
-        try:
-            ob_raw = raw.get("offerbyvin",{}).get("result",{})
-            ob = ob_raw.get("offerbyvin") or ob_raw.get("result") or ob_raw
-            if isinstance(ob, dict) and isinstance(ob.get("offers"), list):
-                offers = ob.get("offers")
-        except:
-            offers = []
-    offers_human = ""
-    if offers:
-        for off in offers[:5]:
-            if isinstance(off, dict):
-                offers_human += f"{off.get('date','')} — {off.get('mileage','')} км — {off.get('price','')} ₽ — {off.get('plate','')} — {off.get('city','')} — {off.get('source','Авито')}\n"
-    else:
-        offers_human = "нет объявлений в offerbyvin"
-
-    prompt = f"""ВХОДНЫЕ ДАННЫЕ — ТОЛЬКО РЕАЛЬНЫЕ ДАННЫЕ ИЗ 9 БАЗ APIPOINT:
-
-VIN: {vin}
-Гос: {reg}
-Модель из базы: {auto.get('model')} {auto.get('year')} {auto.get('engine_code')} {auto.get('engine_vol')} {auto.get('color')} {auto.get('gearbox')} {auto.get('type')}
-Владельцев: {auto.get('owners')} ПТС: {auto.get('pts')} СТС: {auto.get('sts')}
-Фото: архив VIN {b1} шт, номерограм {b2} шт, улицы {b3} шт
-Объявлений offerbyvin: {len(offers)} | Такси: {auto.get('taxi',{}).get('count',0)} | Каршеринг: {auto.get('carsharing',{}).get('count',0)}
-
---- VINDECODE (полный спек) ---
-{vindecode}
-
---- ПРОБЕГИ (probeg2 + offerbyvin + eaisto) С ПОДПИСЬЮ ИСТОЧНИКА ---
+ПРОБЕГИ:
 {probeg_human}
-RAW probeg2: {probeg_raw}
 
---- ЕАИСТО ДИАГНОСТИЧЕСКИЕ КАРТЫ (источник пробега) ---
-{eaisto_raw}
+ДТП:
+{dtp_human}
 
---- ОБЪЯВЛЕНИЯ (offerbyvin.result.offers) — целиком ---
+ДИЛЕР ТО:
+{service_human}
+
+ОБЪЯВЛЕНИЯ ПО ВСЕМ ГОС:
 {offers_human}
-RAW offerbyvin: {offer_raw}
 
---- НОМЕРОГРАМ (объявления по гос) — целиком ---
-{nomerogram_raw}
+Задача: вердикт ЕХАТЬ/НЕ ЕХАТЬ/ЕХАТЬ ОСТОРОЖНО + кузов, пробег (скрутка?), техника, юридика, торг. Текущий гос {current_gos} ставь в заголовок. Пиши жестко, коротко, по цифрам."""
+    return prompt[:9000]
 
---- ДТП (dtp) — целиком с damagePoints ---
-{dtp_raw}
-
---- ЗАЛОГ / ОГРАНИЧЕНИЯ — целиком ---
-Залог: {zalog_raw}
-ГИБДД: {gibdd_raw}
-Детали залога: {auto.get('zalog',{}).get('details',[])}
-Ограничения ГИБДД: {auto.get('gibdd',{}).get('restrictions',[])}
-Розыск: {auto.get('gibdd',{}).get('wanted',[])}
-Рег история: {auto.get('gibdd',{}).get('reg_history',[])}
-
---- ОСАГО — целиком ---
-{osago_raw}
-Полисы: {auto.get('osago',{}).get('policies',[])}
-
---- КОММЕРЦИЯ — такси и каршеринг — целиком ---
-Такси: {taxi_raw} -> {auto.get('taxi',{})}
-Каршеринг: {carsharing_raw} -> {auto.get('carsharing',{})}
-
---- ЮРИДИКА ---
-{auto.get('juridical')}
-
-ЗАДАЧА:
-Ты автоподборщик. Разнеси тачку по реальным данным всех 9 источников. Клиент хочет понять брать или нет. Не выдумывай данные, говори только что есть в базах выше.
-
-СТРОГИЕ ПРАВИЛА:
-- Указывай источник пробега: "108к по ЕАИСТО 18.06.2022" и "110к по Авито 18.03.2023"
-- Если такси/каршеринг >0 — это жирный минус, пиши сразу в вердикт
-- Если гос не указан — пиши что номерограм/автофото пропущены потому что нет госномера, но offerbyvin дал гос {reg}
-- Если ПТС "Нет данных" — так и пиши
-- Используй offers для анализа цены и пробега
-- Используй nomerogram text для поиска слов "битая", "ржавчина"
-
-ВЫДАЙ ОТВЕТ:
-
-🚦 ВЕРДИКТ: [ЕХАТЬ / НЕ ЕХАТЬ / ЕХАТЬ ОСТОРОЖНО] — 1-2 предложения почему
-
-🎨 КУЗОВ:
-- Что по фото и ДТП damagePoints
-
-⏱️ ПРОБЕГ:
-- Есть ли скрутка? Докажи цифрами с подписью источника
-
-🔧 ТЕХНИКА:
-- Что ломается у этой модели
-
-⚖️ ЮРИДИКА:
-- Залог, ограничения, розыск — целиком из баз
-
-🏷️ ИСТОРИЯ ПРОДАЖ:
-- Сколько объявлений, даты, цены, пробеги, города
-
-🚕 КОММЕРЦИЯ:
-- Такси, каршеринг
-
-💰 ТОРГ:
-- За что торговаться и сколько
-
-✅ ЧТО ПРОВЕРИТЬ У КАПОТА (5-7 точек)
-
-Пиши коротко, жестко, как в гараже. Без воды. Только реальные данные.
-"""
-    return prompt
-
-def generate_logs_file(data):
-    import json
+def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
     meta = data.get("meta",{})
-    logs = data.get("logs",[])
-    raw = data.get("raw",{})
     auto = data.get("autoteka_hard",{})
-    probeg = data.get("probeg",[])
-    vin = meta.get("vin","")
-    reg = meta.get("reg","")
-    txt = f"VIN: {vin} REG: {reg}\n"
-    txt += f"Дата: {__import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
-    txt += "BOOT: v62 FULL 9 SOURCES\n\n"
-    txt += "=== ЛОГИ ЗАПРОСОВ ===\n"
-    txt += "\n".join(logs) + "\n\n"
-    txt += "=== АВТОТЕКА HARD ===\n"
-    try:
-        txt += f"model: {auto.get('model')} year: {auto.get('year')} color: {auto.get('color')} pts: {auto.get('pts')} sts: {auto.get('sts')}\n"
-        txt += f"owners: {auto.get('owners')} dtp: {auto.get('dtp_count')} sales: {auto.get('sales_history')}\n"
-        txt += f"taxi: {auto.get('taxi')} carsharing: {auto.get('carsharing')}\n"
-        txt += f"probeg: {len(probeg)}\n"
-        for p in probeg[:15]:
-            txt += f"  {p}\n"
-    except Exception as e:
-        txt += f"err {e}\n"
-    txt += "\n=== RAW JSON ===\n"
-    for src in ["vindecode","offerbyvin","eaisto","probeg2","gibdd","zalog","dtp","osago","carsharing","taxi","pic_vin","nomerogram","autophoto"]:
-        try:
-            r = raw.get(src)
-            if not r:
-                txt += f"{src}: НЕТ\n"
-                continue
-            result = r.get("result",{})
-            txt += f"\n--- {src} --- keys: {list(result.keys())[:20] if isinstance(result, dict) else type(result)}\n"
-            snippet = json.dumps(result, ensure_ascii=False, indent=2)[:3000]
-            txt += snippet + "\n"
-        except Exception as e:
-            txt += f"{src} err {e}\n"
-    return txt
+    vin = html_lib.escape(meta.get("vin") or "")
+    reg = html_lib.escape(meta.get("current_gos") or meta.get("reg") or "не указан")
+    model_full = html_lib.escape(auto.get("model") or f"Авто {vin[:8]}")
+    verdict_title = "АНАЛИЗ 15 ИСТОЧНИКОВ"; verdict_color = "#111"; verdict_emoji = "🧠"
+    if ai_text:
+        up = ai_text.upper()
+        if "НЕ ЕХАТЬ" in up or "НЕ БРАТЬ" in up: verdict_title = "НЕ ЕХАТЬ"; verdict_color = "#ff3b30"; verdict_emoji = "⛔"
+        elif "ЕХАТЬ" in up and "ОСТОРОЖНО" in up: verdict_title = "ЕХАТЬ ОСТОРОЖНО"; verdict_color = "#ff9500"; verdict_emoji = "⚠️"
+        elif "ЕХАТЬ" in up: verdict_title = "МОЖНО ЕХАТЬ"; verdict_color = "#34c759"; verdict_emoji = "✅"
+    def format_ai(t):
+        if not t: return ""
+        esc = html_lib.escape(t)
+        esc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', esc)
+        return esc.replace('\n','<br>')
+    ai_block = f'<div style="background:#111;color:#fff;border-radius:20px;padding:16px;margin-top:12px"><div style="font-size:11px;opacity:0.6">🧠 {OPENROUTER_MODEL} • ТЕКУЩИЙ ГОС {reg}</div><div style="font-size:13px;line-height:1.5;margin-top:10px">{format_ai(ai_text)}</div></div>' if ai_text else f'<div style="background:#ffeaea;padding:14px;border-radius:18px;margin-top:12px"><b>Ошибка ИИ:</b> {html_lib.escape(str(ai_error))[:600]}</div>' if ai_error else '<div style="background:#f2f2f7;padding:14px;border-radius:18px;margin-top:12px">Нет ключа ИИ</div>'
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ИИ {vin} {reg} v65.6</title><style>body{{font-family:Manrope,sans-serif;background:#f2f2f7;color:#111}} .container{{max-width:440px;margin:0 auto;padding:12px}} .card{{background:#fff;border-radius:24px;padding:18px;margin-top:14px;border:1px solid #e5e5ea}} .verdict{{background:{verdict_color};border-radius:28px;padding:18px;color:#fff}}</style></head><body><div class="container"><div class="verdict"><h1>{verdict_emoji} {verdict_title}</h1><div style="font-size:12px;opacity:0.85;margin-top:8px">{model_full} • ТЕКУЩИЙ {reg} • {vin}</div></div>{ai_block}</div></body></html>"""
 
 def generate_kapot_html():
-    html = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Проверка у капота</title></head>
-<body class="bg-[#f2f2f7]"><div class="max-w-[720px] mx-auto p-4">
-  <div class="bg-white rounded-[24px] p-6 shadow-sm border">
-    <div class="text-[11px] text-gray-400 tracking-widest">КНОПКА 3 • ПРОВЕРКА У КАПОТА • v62 FULL</div>
-    <h1 class="text-[22px] font-bold mt-2">Проверка у капота — пришлите фото и видео</h1>
-    <div class="text-sm text-gray-600 mt-2">Нужен осмотр вживую - все 9 источников уже проверены</div>
-    <div class="mt-6 space-y-3 text-sm">
-      <div class="bg-[#f5f5f7] rounded-xl p-4"><div class="font-bold">📸 Фото (20 шт):</div><div class="text-xs mt-1">1. Кузов по кругу, 2. Зазоры дверей, 3. Арки, пороги, 4. Подкапотка, двигатель, 5. Теплообменник, расширительный бачок, 6. Табличка VIN, 7. ПТС, СТС, 8. Багажник, швы, 9. Салон, приборка, пробег, 10. Толщиномер по 20 точкам</div></div>
-      <div class="bg-[#f5f5f7] rounded-xl p-4"><div class="font-bold">🎥 Видео:</div><div class="text-xs mt-1">1. Запуск на холодную 30 сек (послушаем звук двигателя), 2. Работа на холостых, 3. Газ до 3000, 4. Выхлоп (дым?), 5. Коробка — переключение передач, 6. Ходовая — проезд по неровностям</div></div>
-      <div class="bg-green-50 border border-green-200 rounded-xl p-4"><div class="font-bold text-sm">✅ Что пришлете:</div><div class="text-xs mt-1">Фото и видео кидайте прямо в этот чат — я проанализирую как автоподборщик и дам заключение по двигателю, коробке, кузову.</div></div>
-    </div>
-  </div>
-</div></body></html>"""
-    return html
+    return """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Капот v65.6</title></head><body class="bg-[#f2f2f7]"><div class="max-w-[720px] mx-auto p-4"><div class="bg-white rounded-[24px] p-6 border"><div class="text-[11px] text-gray-400 tracking-widest">v65.6 CURRENT GOS</div><h1 class="text-[22px] font-bold mt-2">Проверка у капота</h1><div class="mt-6 space-y-3 text-sm"><div class="bg-green-50 border border-green-200 rounded-xl p-4"><div class="font-bold">✅ Текущий гос в карточку:</div><div class="text-xs mt-1">Теперь в карточке всегда текущий госномер (из vin2number комм.баз или последний по дате из ТО). А объявления ищем по всем гос что нашли.</div></div></div></div></div></body></html>"""
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
+def generate_logs_file(data):
+    meta = data.get("meta",{}); logs = data.get("logs",[]); raw = data.get("raw",{}); auto = data.get("autoteka_hard",{})
+    vin = meta.get("vin",""); reg = meta.get("reg",""); current = meta.get("current_gos","")
+    all_gos = meta.get("all_gos_found",[])
+    txt = f"VIN: {vin} CURRENT: {current} REG: {reg}\nALL GOS: {all_gos}\nДата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\nBOOT: v65.6 CURRENT GOS\n\n=== ЛОГИ ===\n" + "\n".join(logs) + "\n\n"
+    txt += f"model: {auto.get('model')} year: {auto.get('year')} owners: {auto.get('owners')} dtp: {auto.get('dtp_count')} current: {current} all_gos: {all_gos}\n"
+    for src in ["vindecode","vindecode2","offerbyvin","eaisto","probeg2","gibdd","gai","gibddhistory","vin2number","servicemaintenance","zalog","dtp","osago","carsharing","taxi","pic_vin","pic_gos","autophoto","nomerogram"]:
+        try:
+            r = raw.get(src)
+            if not r: continue
+            result = r.get("result",{})
+            snippet = json.dumps(result, ensure_ascii=False, indent=2)[:2500]
+            txt += f"\n--- {src} ---\n{snippet}\n"
+        except Exception as e:
+            txt += f"{src} err {e}\n"
+    for key in raw.keys():
+        if key.startswith("offerbygosnum_") or key.startswith("offerbyvin_by_reg_"):
+            try:
+                r = raw.get(key)
+                result = r.get("result",{})
+                snippet = json.dumps(result, ensure_ascii=False, indent=2)[:2500]
+                txt += f"\n--- {key} ---\n{snippet}\n"
+            except Exception as e:
+                txt += f"{key} err {e}\n"
+    return txt
 
-bot = Bot(token=os.getenv("BOT_TOKEN"))
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 def main_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="1️⃣ Проверка истории авто по VIN"), KeyboardButton(text="2️⃣ Предварительные рекомендации ИИ")],
-        [KeyboardButton(text="3️⃣ Проверка у капота"), KeyboardButton(text="📋 Логи Apipoint")],
-        [KeyboardButton(text="🔄 Пересобрать визуал")]
-    ], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="1️⃣ Проверка истории авто по VIN"), KeyboardButton(text="2️⃣ Предварительные рекомендации ИИ")],[KeyboardButton(text="3️⃣ Проверка у капота"), KeyboardButton(text="📋 Логи Apipoint")],[KeyboardButton(text="🔄 Пересобрать визуал")]], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    global LAST_REQUEST, LAST_REPORT_DATA
-    LAST_REQUEST = {"vin": None, "reg": None}
-    LAST_REPORT_DATA = {}
-    await m.answer(
-        f"Привет! Я помогу не купить хлам 👍\n\n"
-        f"Я — твой автоподборщик в телефоне. Проверяю то, что обычно скрывает продавец.\n\n"
-        f"Что делаем по шагам:\n\n"
-        f"1️⃣ Проверка истории авто по VIN\n"
-        f"Пробью по всем официальным базам: ДТП с расчетами ремонта — что меняли и что красили, реальный пробег и скрутки (с подписью источника: ГИБДД, ЕАИСТО, Авито), залог, лизинг, ограничения и розыск ГИБДД, работа в такси и каршеринге, владельцы и ПТС, ОСАГО. Вытащу все фото машины из старых объявлений за последние годы.\n\n"
-        f"2️⃣ Предварительные рекомендации ИИ — скажу, стоит ли вообще ехать смотреть\n"
-        f"На основе истории дам честное заключение как живой подборщик. Сравню фото по датам, подскажу куда тыкать толщиномером и на сколько торговаться.\n\n"
-        f"3️⃣ Проверка у капота — проверим вместе, когда ты уже у машины\n"
-        f"Ты на месте? Скинь сюда 20 фото и 2-3 видео — оценю за 5 минут — брать или бежать.\n\n"
-        f"👇 Пришли VIN или госномер — за 1 минуту соберу первый отчет и пойдем по этапам.",
-        reply_markup=main_kb()
-    )
+    ud = get_user_data(m.from_user.id)
+    ud["last_request"] = {"vin": None, "reg": None, "ts": 0}
+    ud["last_report"] = {}
+    await m.answer("Привет! v65.6 • ТЕКУЩИЙ ГОС В КАРТОЧКУ 👇\n\n✅ Карточка по VIN, но текущий госномер = самый свежий:\n   1) vin2number 6₽ комм.базы (приоритет)\n   2) последний по дате из ТО eaisto\n   3) из объявлений / дилер ТО\n\n✅ Объявления = по ВСЕМ гос что находим (до 5 номеров)\n\nПришли VIN.", reply_markup=main_kb())
 
 @dp.message()
 async def handle(m: types.Message):
-    global LAST_REQUEST, LAST_REPORT_DATA
+    user_id = m.from_user.id
+    now = time.time()
+    if user_id in COOLDOWN and now - COOLDOWN[user_id] < 3:
+        await m.answer("⏳ Чуть помедленнее...")
+        return
+    COOLDOWN[user_id] = now
+    ud = get_user_data(user_id)
     text_raw = (m.text or "").strip()
     txt_low = (m.text or "").lower()
     mm_gos = re.search(r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}', text_raw.upper())
     mm_vin = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text_raw.upper())
-    reg = None
-    if mm_gos:
-        reg = mm_gos.group(0)
+    reg = mm_gos.group(0) if mm_gos else None
+    vin_candidate = mm_vin.group(0) if mm_vin else None
 
     if "пересобрать визуал" in txt_low:
-        data = None
-        vin = None
-        if LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin"):
-            vin = LAST_REPORT_DATA.get("meta",{}).get("vin")
-            data = LAST_REPORT_DATA
-            await m.answer(f"🔄 Пересобираю визуал v62 FULL для {vin} из последнего отчета — без доп. оплаты Apipoint...")
-            html = generate_history_html(f"{vin}_rebuild", data)
-            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v62_FULL_REBUILD.html")
-            await m.answer_document(file, caption=f"🔄 FULL визуал {vin} • Гос {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • 9 источников • Без доп. запросов", reply_markup=main_kb())
+        data = ud.get("last_report")
+        if data and data.get("meta",{}).get("vin"):
+            vin = data.get("meta",{}).get("vin")
+            await m.answer(f"🔄 Пересобираю v65.6 для {vin} из памяти...")
+            html_out = generate_history_html(f"{vin}_rebuild", data)
+            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin}_v65.6_REBUILD.html")
+            await m.answer_document(file, caption=f"🔄 v65.6 REBUILD {vin} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
             return
-        vin = LAST_REQUEST.get("vin")
-        if mm_vin:
-            vin = mm_vin.group(0)
-        if not vin:
-            await m.answer("Нет последнего VIN в памяти (бот перезапускался). Пришли VIN — пересоберу визуал.\nНапример: WF0UXXGAJU8A66030", reply_markup=main_kb())
+        if vin_candidate:
+            await m.answer(f"🔄 Пересобираю v65.6 для {vin_candidate}...")
+            data = await check_history(vin_candidate, reg, user_id)
+            ud["last_report"] = data
+            ud["last_request"] = {"vin": vin_candidate, "reg": reg, "ts": now}
+            html_out = generate_history_html(vin_candidate, data)
+            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v65.6.html")
+            await m.answer_document(file, caption=f"🔄 v65.6 {vin_candidate}", reply_markup=main_kb())
             return
-        reg_last = LAST_REQUEST.get("reg") or reg
-        await m.answer(f"🔄 Пересобираю визуал v62 FULL для {vin} + {reg_last}... Запрошу Apipoint заново")
-        data = await check_history(vin, reg_last)
-        html = generate_history_html(f"{vin}_rebuild", data)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v62_FULL_REBUILD.html")
-        await m.answer_document(file, caption=f"🔄 Пересобран FULL визуал: {len(data.get('all_b64',[]))} фото • Гос {data.get('meta',{}).get('reg')}", reply_markup=main_kb())
+        await m.answer("Нет VIN в памяти.", reply_markup=main_kb())
         return
 
     if "проверка у капота" in txt_low or txt_low.startswith("3️⃣"):
-        await m.answer(
-            f"3️⃣ Проверка у капота — как в первой версии\n\n"
-            f"Пришлите в этот чат:\n"
-            f"📸 20 фото: кузов по кругу, зазоры, арки, пороги, подкапотка, двигатель, теплообменник, бачок, VIN табличка, ПТС/СТС, багажник швы, салон, приборка, толщиномер 20 точек\n\n"
-            f"🎥 Видео: запуск на холодную 30 сек, холостые, газ до 3000, выхлоп, коробка, ходовая\n\n"
-            f"Я проанализирую как автоподборщик",
-            reply_markup=main_kb()
-        )
-        html = generate_kapot_html()
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"Kapot_Check_Instructions_v62_FULL.html")
-        await m.answer_document(file, caption=f"📋 Инструкция для проверки у капота", reply_markup=main_kb())
+        await m.answer("3️⃣ Пришли 20 фото + видео. Сначала 1️⃣ чтобы я знал VIN.", reply_markup=main_kb())
+        html_out = generate_kapot_html()
+        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"Kapot_v65.6.html")
+        await m.answer_document(file, caption="📋 Инструкция v65.6 CURRENT GOS", reply_markup=main_kb())
         return
 
     if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
-        vin_for_ai = None
-        if mm_vin:
-            vin_for_ai = mm_vin.group(0)
-        elif LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin"):
-            vin_for_ai = LAST_REPORT_DATA.get("meta",{}).get("vin")
-        elif LAST_REQUEST.get("vin"):
-            vin_for_ai = LAST_REQUEST.get("vin")
-
+        vin_for_ai = vin_candidate or ud.get("last_request",{}).get("vin") or ud.get("last_report",{}).get("meta",{}).get("vin")
         if not vin_for_ai:
-            await m.answer(
-                f"Пришли VIN для ИИ разбора — я сам подтяну историю и сделаю рекомендации.\n\n"
-                f"Например: WF0UXXGAJU8A66030\n"
-                f"Или нажми 1️⃣ если хочешь сначала посмотреть историю.",
-                reply_markup=main_kb()
-            )
+            await m.answer("Пришли VIN для ИИ.", reply_markup=main_kb())
             return
-
-        if LAST_REPORT_DATA and LAST_REPORT_DATA.get("meta",{}).get("vin") == vin_for_ai:
-            data_for_ai = LAST_REPORT_DATA
-            await m.answer(f"🤖 Беру последний отчет для {vin_for_ai} — формирую рекомендации ИИ через {OPENROUTER_MODEL}... 15-30 сек ⏳")
+        if not is_valid_vin(vin_for_ai):
+            await m.answer(f"VIN {vin_for_ai} невалидный.", reply_markup=main_kb())
+            return
+        data_for_ai = None
+        if ud.get("last_report") and ud["last_report"].get("meta",{}).get("vin") == vin_for_ai:
+            data_for_ai = ud["last_report"]
+            await m.answer(f"🤖 Беру из памяти {vin_for_ai} — ИИ разбор {OPENROUTER_MODEL}...")
         else:
-            await m.answer(f"🤖 Для {vin_for_ai} нет свежего отчета в памяти — собираю историю (1-2 мин) и сразу сделаю ИИ разбор через {OPENROUTER_MODEL}... ⏳")
+            await m.answer(f"🤖 Собираю 15 источников для {vin_for_ai} и сразу ИИ...")
             try:
-                data_for_ai = await check_history(vin_for_ai, reg)
+                await bot.send_chat_action(m.chat.id, "typing")
+                data_for_ai = await check_history(vin_for_ai, reg, user_id)
+                ud["last_report"] = data_for_ai
+                ud["last_request"] = {"vin": vin_for_ai, "reg": reg, "ts": now}
                 html_hist = generate_history_html(vin_for_ai, data_for_ai)
-                file_hist = BufferedInputFile(html_hist.encode('utf-8'), filename=f"History_{vin_for_ai}_v62_FULL.html")
-                await m.answer_document(file_hist, caption=f"1️⃣ История {vin_for_ai} • {data_for_ai.get('meta',{}).get('reg')} • {len(data_for_ai.get('all_b64',[]))} фото — теперь делаю ИИ разбор", reply_markup=main_kb())
+                file_hist = BufferedInputFile(html_hist.encode('utf-8'), filename=f"History_{vin_for_ai}_v65.6.html")
+                await m.answer_document(file_hist, caption=f"1️⃣ История {vin_for_ai} • ТЕКУЩИЙ {data_for_ai.get('meta',{}).get('current_gos','')} • {len(data_for_ai.get('all_b64',[]))} фото", reply_markup=main_kb())
             except Exception as e:
-                await m.answer(f"❌ Не смог собрать историю для {vin_for_ai}: {e}", reply_markup=main_kb())
+                log.exception("check_history failed")
+                await m.answer(f"❌ Ошибка: {e}", reply_markup=main_kb())
                 return
-
-        await m.answer(f"🤖 Формирую живой разбор подборщика для {vin_for_ai}... (9 источников)")
+        await bot.send_chat_action(m.chat.id, "typing")
         prompt = build_prompt_for_openrouter(data_for_ai)
         ai_text, ai_error = await call_openrouter_ai(prompt)
-        if ai_text:
-            await m.answer(f"✅ ИИ ответил, собираю итоговый отчет v62 FULL LIVE для {vin_for_ai}...")
-        else:
-            await m.answer(f"⚠️ OpenRouter не ответил: {ai_error} — сделаю отчет на шаблонах")
-        html = generate_ai_recommendations_html(data_for_ai, ai_text=ai_text, ai_error=ai_error)
-        file = BufferedInputFile(html.encode('utf-8'), filename=f"AI_Recommendations_{vin_for_ai}_v62_FULL_LIVE.html")
-        caption = f"2️⃣ ИИ рекомендации FULL LIVE для {vin_for_ai} — {OPENROUTER_MODEL}\n" + (ai_text[:600] + "..." if ai_text and len(ai_text)>600 else (ai_text[:600] if ai_text else f"Ошибка: {ai_error}"))
-        await m.answer_document(file, caption=caption[:1000], reply_markup=main_kb())
+        html_out = generate_ai_recommendations_html(data_for_ai, ai_text=ai_text, ai_error=ai_error)
+        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"AI_{vin_for_ai}_v65.6.html")
+        caption = (ai_text[:800] + "..." if ai_text and len(ai_text)>800 else ai_text or f"Ошибка: {ai_error}")[:1000]
+        await m.answer_document(file, caption=caption, reply_markup=main_kb())
         return
 
     if "логи apipoint" in txt_low or txt_low.startswith("📋"):
-        data = LAST_REPORT_DATA
+        data = ud.get("last_report")
         if not data or not data.get("meta"):
-            await m.answer("Нет последнего отчета в памяти (бот перезапускался). Пришли VIN чтобы собрать отчет и логи.", reply_markup=main_kb())
+            await m.answer("Нет отчета.", reply_markup=main_kb())
             return
         vin = data.get("meta",{}).get("vin","unknown")
         logs_txt = generate_logs_file(data)
-        file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v62_FULL.txt")
-        await m.answer_document(file_logs, caption=f"📋 Логи Apipoint для {vin} • {data.get('meta',{}).get('reg')} • 9 источников • Кинь этот файл мне", reply_markup=main_kb())
+        file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v65.6.txt")
+        await m.answer_document(file_logs, caption=f"📋 Логи v65.6 {vin} ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')}", reply_markup=main_kb())
         return
 
-    if "проверка истории" in txt_low or "истории авто" in txt_low or txt_low.startswith("1️⃣") or mm_vin:
-        if mm_vin:
-            vin = mm_vin.group(0)
-            await m.answer(f"Принял VIN {vin} 👍\n\nСобираю FULL отчет по истории — 9 источников с подписью: probeg2, eaisto, offerbyvin, dtp, zalog, gibdd, osago, taxi, carsharing + фото + график.\n\nЗаймет 1-2 минуты ⏳")
-            data = await check_history(vin, reg)
-            html = generate_history_html(vin, data)
-            file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v62_FULL.html")
-            await m.answer_document(file, caption=f"1️⃣ FULL История {vin} • {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • 9 источников • Теперь 2️⃣ возьмет этот отчет без доп. оплаты", reply_markup=main_kb())
+    if "проверка истории" in txt_low or txt_low.startswith("1️⃣") or vin_candidate:
+        if vin_candidate:
+            if not is_valid_vin(vin_candidate):
+                await m.answer(f"VIN {vin_candidate} невалидный.", reply_markup=main_kb())
+                return
+            await m.answer(f"Принял VIN {vin_candidate} 👍 v65.6 ТЕКУЩИЙ ГОС В КАРТОЧКУ + объявления по всем гос ⏳")
+            await bot.send_chat_action(m.chat.id, "typing")
             try:
-                logs_txt = generate_logs_file(data)
-                file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v62_FULL.txt")
-                await m.answer_document(file_logs, caption=f"📋 Логи для {vin} — кинь мне этот файл если что-то не подтянулось", reply_markup=main_kb())
+                data = await check_history(vin_candidate, reg, user_id)
+                ud["last_report"] = data
+                ud["last_request"] = {"vin": vin_candidate, "reg": reg, "ts": now}
+                html_out = generate_history_html(vin_candidate, data)
+                file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v65.6.html")
+                await m.answer_document(file, caption=f"1️⃣ v65.6 {vin_candidate} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • ВСЕ ГОС: {','.join(data.get('meta',{}).get('all_gos_found',[])[:3])} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
+                try:
+                    logs_txt = generate_logs_file(data)
+                    file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin_candidate}_v65.6.txt")
+                    await m.answer_document(file_logs, caption=f"📋 Логи {vin_candidate}", reply_markup=main_kb())
+                except Exception as e:
+                    await m.answer(f"⚠️ Логи: {e}")
             except Exception as e:
-                await m.answer(f"⚠️ Не смог собрать логи: {e}")
+                log.exception("history failed")
+                await m.answer(f"❌ Ошибка: {e}", reply_markup=main_kb())
             return
         if txt_low.startswith("1️⃣"):
-            await m.answer("Пришли VIN для проверки истории (Кнопка 1)", reply_markup=main_kb())
+            await m.answer("Пришли VIN 17 символов.", reply_markup=main_kb())
             return
 
     if m.photo or m.video or m.video_note or m.document:
-        await m.answer(
-            f"Принял фото/видео для проверки у капота ✅\n\n"
-            f"Если это фото кузова, двигателя, VIN, ПТС — проанализирую как автоподборщик\n"
-            f"Если видео звука двигателя — послушаю двигатель на предмет стуков, масложора, течи\n\n"
-            f"Для полного анализа еще нужен VIN — сделай сначала 1️⃣ Проверка истории, потом кидай фото сюда",
-            reply_markup=main_kb()
-        )
+        await m.answer("Принял фото/видео ✅ Сначала 1️⃣ чтобы я знал VIN.", reply_markup=main_kb())
         return
 
-    await m.answer("Пришли VIN или выбери кнопку:\n1️⃣ Проверка истории авто по VIN\n2️⃣ Предварительные рекомендации ИИ\n3️⃣ Проверка у капота\n🔄 Пересобрать визуал", reply_markup=main_kb())
+    await m.answer("Пришли VIN или выбери кнопку:\n1️⃣ История 15 источников\n2️⃣ ИИ\n3️⃣ У капота", reply_markup=main_kb())
 
 async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook deleted, polling start v62 FULL")
+        log.info("Webhook deleted, polling v65.6")
     except Exception as e:
-        print(f"delete_webhook error: {e}")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        log.warning(f"delete_webhook {e}")
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await close_session()
 
 if __name__ == "__main__":
     asyncio.run(main())
