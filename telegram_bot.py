@@ -148,6 +148,7 @@ def get_autoteka_hard_for_vin(vin, reg):
         "nomerogram_full": {"ads": []}
     }
 
+
 async def check_history(vin, reg_num=None):
     global LAST_REQUEST
     if LAST_REQUEST["vin"] != vin:
@@ -167,7 +168,101 @@ async def check_history(vin, reg_num=None):
     logs = combined["logs"]
     logs.append(f"START v62 FULL vin={vin} reg={actual_reg}")
 
+    # Helper to recursively find offers-like list
+    def find_offers_list(obj):
+        if isinstance(obj, dict):
+            # direct keys
+            for k in ["offers", "list", "result", "items"]:
+                v = obj.get(k)
+                if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
+                    # check if looks like offer (has mileage or plate or price)
+                    if any("mileage" in x or "plate" in x or "gosnomer" in x or "price" in x for x in v[:2]):
+                        return v
+            # search deeper
+            for v in obj.values():
+                res = find_offers_list(v)
+                if res:
+                    return res
+        elif isinstance(obj, list) and len(obj)>0 and isinstance(obj[0], dict):
+            if any("mileage" in x or "plate" in x for x in obj[:2]):
+                return obj
+            for item in obj:
+                res = find_offers_list(item)
+                if res:
+                    return res
+        return None
+
+    def find_vindecode_dict(obj):
+        # returns dict that looks like vindecode
+        if isinstance(obj, dict):
+            # if has brand/model/year keys
+            if any(k in obj for k in ["brand", "make", "model", "modelName", "year", "productionYear"]):
+                return obj
+            for v in obj.values():
+                if isinstance(v, dict):
+                    res = find_vindecode_dict(v)
+                    if res:
+                        return res
+                elif isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, dict):
+                            res = find_vindecode_dict(it)
+                            if res:
+                                return res
+        return None
+
+    def parse_eaisto_date(d):
+        # handles timestamp int, float, string timestamp, and normal date strings
+        if not d:
+            return ""
+        try:
+            # int timestamp
+            if isinstance(d, (int, float)):
+                try:
+                    dt = datetime.fromtimestamp(int(d))
+                    return dt.strftime("%d.%m.%Y")
+                except:
+                    pass
+            s = str(d).strip()
+            # handle "1655510400.0" or "1655510400.000"
+            if "." in s:
+                s_part = s.split(".")[0]
+                if s_part.isdigit() and len(s_part) >= 10:
+                    try:
+                        dt = datetime.fromtimestamp(int(s_part[:10]))
+                        return dt.strftime("%d.%m.%Y")
+                    except:
+                        pass
+            if s.isdigit():
+                # if 10 digits - unix timestamp
+                if len(s) == 10:
+                    try:
+                        dt = datetime.fromtimestamp(int(s))
+                        return dt.strftime("%d.%m.%Y")
+                    except:
+                        pass
+                # if 13 digits - ms timestamp
+                if len(s) == 13:
+                    try:
+                        dt = datetime.fromtimestamp(int(s)//1000)
+                        return dt.strftime("%d.%m.%Y")
+                    except:
+                        pass
+            # try to find 10-digit timestamp inside string
+            import re as _re
+            m = _re.search(r'(\d{10})', s)
+            if m:
+                try:
+                    dt = datetime.fromtimestamp(int(m.group(1)))
+                    return dt.strftime("%d.%m.%Y")
+                except:
+                    pass
+            return s
+        except:
+            return str(d)
+
     derived_reg = None
+    # 1. pic by vin
     status, data_pic_vin, _ = await apipoint_call({"sources": "pic", "vin": vin})
     combined["raw"]["pic_vin"] = data_pic_vin
     logs.append(f"pic vin {vin} -> {status}")
@@ -191,24 +286,98 @@ async def check_history(vin, reg_num=None):
     except Exception as e:
         logs.append(f"pic vin err {e}")
 
+    # 2. СРАЗУ запрашиваем vindecode, offerbyvin, eaisto, probeg2, zalog, dtp, gibdd, osago, taxi, carsharing чтобы вытащить госномер
+    pre_sources = ["vindecode", "offerbyvin", "eaisto", "probeg2", "gibdd", "zalog", "dtp", "osago", "carsharing", "taxi"]
+    for src in pre_sources:
+        status, data_src, _ = await apipoint_call({"sources": src, "vin": vin})
+        combined["raw"][src] = data_src
+        logs.append(f"{src} -> {status}")
+        if src == "probeg2":
+            try:
+                res = data_src.get("result") or {}
+                lst = []
+                if isinstance(res, dict):
+                    if isinstance(res.get("result"), list):
+                        lst = res.get("result")
+                    elif isinstance(res.get("probeg2"), dict):
+                        lst = res.get("probeg2",{}).get("result",[])
+                    elif isinstance(res.get("list"), list):
+                        lst = res.get("list")
+                combined["probeg"] = lst
+            except:
+                pass
+
+    # 3. Парсим offerbyvin СРАЗУ чтобы получить госномер для номерограм/автофото
+    try:
+        ob_raw = combined["raw"].get("offerbyvin",{}).get("result",{})
+        offers = find_offers_list(ob_raw) or []
+        if offers:
+            combined["raw"]["offerbyvin_parsed"] = offers
+            combined["autoteka_hard"]["offerbyvin_full"]["offers"] = offers
+            found_plate = None
+            for off in offers:
+                if not isinstance(off, dict):
+                    continue
+                plate = off.get("plate") or off.get("gosnomer") or off.get("regNum") or off.get("number") or ""
+                if plate and not found_plate:
+                    import re as _re
+                    if _re.search(r'[АВЕКМНОРСТУХA-Z0-9]{2,}', str(plate).upper()):
+                        found_plate = str(plate).strip()
+            if found_plate and (not actual_reg or actual_reg == "не указан"):
+                actual_reg = found_plate
+                combined["meta"]["reg"] = found_plate
+                LAST_REQUEST["reg"] = found_plate
+                combined["autoteka_hard"]["gos"] = found_plate
+                logs.append(f"offerbyvin found plate {found_plate} - will query nomerogram/autophoto")
+    except Exception as e:
+        logs.append(f"offerbyvin early parse err {e}")
+
+    # 4. Теперь зная госномер - запрашиваем номерограм, автофото, pic по гос и offerbyvin по гос (иногда по VIN пусто, а по гос есть)
     if actual_reg and actual_reg != "не указан":
-        status, data_pic_gos, _ = await apipoint_call({"sources": "pic", "gosnomer": actual_reg})
-        logs.append(f"pic gos {actual_reg} -> {status}")
+        # дополнительно дергаем offerbyvin по госномеру - часто там есть объявления когда по VIN пусто
         try:
-            result = data_pic_gos.get("result") or {}
-            pic_obj = result.get("pic") or result
-            if isinstance(pic_obj, dict):
-                for url in (pic_obj.get("imageList") or [])[:20]:
-                    if any(x["url"] == url for x in combined["block1_pic"]):
-                        continue
-                    b64 = await download_image_any(url)
-                    item = {"source": "pic", "price": "1.50", "type": f"Архив по гос {actual_reg}", "date": "Архив по гос", "url": url, "gosnomer": actual_reg, "desc": f"Архив по гос {actual_reg}"}
-                    if b64:
-                        item["b64"] = b64
-                        combined["all_b64"].append(b64)
-                    combined["block1_pic"].append(item)
+            status_ob_gos, data_ob_gos, _ = await apipoint_call({"sources": "offerbyvin", "regNum": actual_reg})
+            logs.append(f"offerbyvin by reg {actual_reg} -> {status_ob_gos}")
+            if status_ob_gos == 200:
+                # мерджим с основным offerbyvin
+                offers_gos = find_offers_list(data_ob_gos.get("result",{})) or []
+                if offers_gos:
+                    existing = combined["raw"].get("offerbyvin_parsed") or []
+                    # объединяем без дублей
+                    combined["raw"]["offerbyvin_parsed"] = existing + [o for o in offers_gos if o not in existing]
+                    combined["raw"]["offerbyvin_by_reg"] = data_ob_gos
+                    logs.append(f"offerbyvin by reg found {len(offers_gos)} offers")
+        except Exception as e:
+            logs.append(f"offerbyvin by reg err {e}")
+
+        # также пробуем vindecode по гос? иногда помогает
+        try:
+            status_vd_gos, data_vd_gos, _ = await apipoint_call({"sources": "vindecode", "regNum": actual_reg})
+            logs.append(f"vindecode by reg {actual_reg} -> {status_vd_gos}")
+            if status_vd_gos == 200:
+                combined["raw"]["vindecode_by_reg"] = data_vd_gos
         except:
             pass
+
+        # pic by gos if not already
+        if not derived_reg or derived_reg != actual_reg:
+            status, data_pic_gos, _ = await apipoint_call({"sources": "pic", "gosnomer": actual_reg})
+            logs.append(f"pic gos {actual_reg} -> {status}")
+            try:
+                result = data_pic_gos.get("result") or {}
+                pic_obj = result.get("pic") or result
+                if isinstance(pic_obj, dict):
+                    for url in (pic_obj.get("imageList") or [])[:20]:
+                        if any(x["url"] == url for x in combined["block1_pic"]):
+                            continue
+                        b64 = await download_image_any(url)
+                        item = {"source": "pic", "price": "1.50", "type": f"Архив по гос {actual_reg}", "date": "Архив по гос", "url": url, "gosnomer": actual_reg, "desc": f"Архив по гос {actual_reg}"}
+                        if b64:
+                            item["b64"] = b64
+                            combined["all_b64"].append(b64)
+                        combined["block1_pic"].append(item)
+            except:
+                pass
 
         status, data_nomer, _ = await apipoint_call({"sources": "nomerogram", "regNum": actual_reg})
         combined["raw"]["nomerogram"] = data_nomer
@@ -229,7 +398,6 @@ async def check_history(vin, reg_num=None):
                     price = r.get("price") or ""
                     mileage = r.get("mileage") or r.get("probeg") or ""
                     imgs = r.get("img") or []
-                    # 9. Забираем целиком - сохраняем в full
                     combined["autoteka_hard"]["nomerogram_full"]["ads"].append({
                         "date": date, "url": url, "text": str(text)[:2000], "title": title, "source": source, "price": price, "mileage": mileage
                     })
@@ -268,37 +436,43 @@ async def check_history(vin, reg_num=None):
         except Exception as e:
             logs.append(f"autophoto err {e}")
     else:
-        logs.append(f"SKIP nomerogram/autophoto - нет госномера")
+        logs.append(f"SKIP nomerogram/autophoto - нет госномера даже после offerbyvin")
 
-    for src in ["probeg2", "vindecode", "zalog", "dtp", "carsharing", "taxi", "offerbyvin", "gibdd", "eaisto", "osago"]:
-        status, data_src, _ = await apipoint_call({"sources": src, "vin": vin})
-        combined["raw"][src] = data_src
-        logs.append(f"{src} -> {status}")
-        if src == "probeg2":
-            try:
-                res = data_src.get("result") or {}
-                lst = []
-                if isinstance(res, dict):
-                    if isinstance(res.get("result"), list):
-                        lst = res.get("result")
-                    elif isinstance(res.get("probeg2"), dict):
-                        lst = res.get("probeg2",{}).get("result",[])
-                combined["probeg"] = lst
-            except:
-                pass
-
-    # --- v62 FULL PARSE ALL 9 SOURCES ---
+    # --- v62 FULL PARSE ALL 9 SOURCES ROBUST ---
     try:
         ah = combined["autoteka_hard"]
-        # 6. vindecode целиком
+        # 6. vindecode целиком - robust with deep search and many key variants
         vd_raw = combined["raw"].get("vindecode",{}).get("result",{})
-        vd = vd_raw.get("vindecode") or vd_raw.get("result") or vd_raw
+        vd = None
+        # try many nesting levels
+        for attempt in [find_vindecode_dict(vd_raw), vd_raw.get("vindecode"), vd_raw.get("result"), vd_raw]:
+            if isinstance(attempt, dict):
+                vd = attempt
+                # if this dict itself has vindecode inside, dive
+                if "vindecode" in vd and isinstance(vd["vindecode"], dict):
+                    vd = vd["vindecode"]
+                if "result" in vd and isinstance(vd["result"], dict) and any(k in vd["result"] for k in ["brand","make","model","year"]):
+                    vd = vd["result"]
+                if find_vindecode_dict(vd):
+                    vd = find_vindecode_dict(vd)
+                    break
+                if any(k in vd for k in ["brand","make","model","year","manufacturer"]):
+                    break
         if isinstance(vd, dict):
+            # final deep search
+            deep = find_vindecode_dict(vd)
+            if deep:
+                vd = deep
             ah["vindecode_full"] = vd
+            # log keys for debug
+            logs.append(f"vindecode keys: {list(vd.keys())[:20]}")
+        else:
+            logs.append(f"vindecode empty or not dict: {type(vd)} raw keys {list(vd_raw.keys()) if isinstance(vd_raw, dict) else 'not dict'}")
+            vd = {}
             brand = vd.get("brand") or vd.get("make") or vd.get("manufacturer") or ""
             model = vd.get("model") or vd.get("modelName") or ""
             year = vd.get("year") or vd.get("productionYear") or vd.get("yearOfManufacture") or vd.get("modelYear") or ""
-            engine_vol = vd.get("engineVolume") or vd.get("engine") or vd.get("engineSize") or vd.get("displacement") or ""
+            engine_vol = vd.get("engineVolume") or vd.get("engine") or vd.get("engineSize") or vd.get("displacement") or vd.get("engine_volume") or ""
             power = vd.get("power") or vd.get("enginePower") or vd.get("powerHp") or ""
             body = vd.get("body") or vd.get("bodyType") or vd.get("vehicleType") or ""
             color = vd.get("color") or vd.get("bodyColor") or ""
@@ -327,11 +501,6 @@ async def check_history(vin, reg_num=None):
             if gearbox:
                 if not ah.get("gearbox"):
                     ah["gearbox"] = str(gearbox)
-            # extra
-            if fuel:
-                ah["vindecode_full"]["fuel_parsed"] = fuel
-            if drive:
-                ah["vindecode_full"]["drive_parsed"] = drive
             pts_vd = vd.get("pts") or vd.get("ptsNumber") or vd.get("vehiclePassportNumber") or ""
             if pts_vd and not ah.get("pts"):
                 ah["pts"] = str(pts_vd)
@@ -340,17 +509,14 @@ async def check_history(vin, reg_num=None):
         gib_raw = combined["raw"].get("gibdd",{}).get("result",{})
         gib = gib_raw.get("gibdd") or gib_raw.get("result") or gib_raw
         if isinstance(gib, dict):
-            # owners
             if isinstance(gib.get("ownershipPeriods"), list) and gib.get("ownershipPeriods"):
                 ah["owners"] = len(gib.get("ownershipPeriods"))
                 ah["gibdd"]["owners"] = gib.get("ownershipPeriods")
                 last = gib.get("ownershipPeriods")[-1]
                 if isinstance(last, dict) and last.get("pts") and not ah.get("pts"):
                     ah["pts"] = str(last.get("pts"))
-            # reg history
             if isinstance(gib.get("registrationHistory"), list):
                 ah["gibdd"]["reg_history"] = gib.get("registrationHistory")
-            # restrictions
             if isinstance(gib.get("restrictions"), list):
                 ah["gibdd"]["restrictions"] = gib.get("restrictions")
                 if gib.get("restrictions"):
@@ -359,11 +525,9 @@ async def check_history(vin, reg_num=None):
                     ah["juridical"]["ограничения"] = "Не найдены"
             elif isinstance(gib.get("restrict"), list):
                 ah["gibdd"]["restrictions"] = gib.get("restrict")
-            # wanted
             if isinstance(gib.get("wanted"), list):
                 ah["gibdd"]["wanted"] = gib.get("wanted")
                 ah["juridical"]["розыск"] = f"Найдено {len(gib.get('wanted'))}" if gib.get("wanted") else "Не найден"
-            # pts, sts
             for k in ["pts", "ptsNumber", "vehiclePassport", "sts", "stsNumber"]:
                 if gib.get(k) and not ah.get(k if k in ["pts","sts"] else ""):
                     if "pts" in k.lower() and not ah.get("pts"):
@@ -390,7 +554,7 @@ async def check_history(vin, reg_num=None):
                     if not isinstance(d, dict):
                         continue
                     norm.append({
-                        "date": d.get("date") or d.get("accidentDate") or d.get("eventDate") or "",
+                        "date": parse_eaisto_date(d.get("date") or d.get("accidentDate") or d.get("eventDate") or ""),
                         "type": d.get("type") or d.get("accidentType") or "ДТП",
                         "damage": d.get("damage") or d.get("damageType") or "Нет данных",
                         "damagePoints": d.get("damagePoints") or d.get("damagedParts") or [],
@@ -401,62 +565,39 @@ async def check_history(vin, reg_num=None):
                 ah["dtp"] = norm
             elif isinstance(dtp_inner, list):
                 ah["dtp_count"] = len(dtp_inner)
-                ah["dtp"] = [{"date": d.get("date",""), "type": d.get("type","ДТП"), "damage": d.get("damage",""), "damagePoints": d.get("damagePoints",[]), "region": d.get("region",""), "participants":0, "cost":""} for d in dtp_inner[:10] if isinstance(d, dict)]
+                ah["dtp"] = [{"date": parse_eaisto_date(d.get("date","")), "type": d.get("type","ДТП"), "damage": d.get("damage",""), "damagePoints": d.get("damagePoints",[]), "region": d.get("region",""), "participants":0, "cost":""} for d in dtp_inner[:10] if isinstance(d, dict)]
         except Exception as e:
             logs.append(f"dtp parse err {e}")
 
-        # 8. offerbyvin целиком - ГЛАВНЫЙ ИСТОЧНИК
+        # 8. offerbyvin целиком - уже нашли offers ранее, но дополним
         try:
-            ob_raw = combined["raw"].get("offerbyvin",{}).get("result",{})
-            ob = ob_raw.get("offerbyvin") or ob_raw.get("result") or ob_raw
-            offers = []
-            if isinstance(ob, dict):
-                if isinstance(ob.get("offers"), list):
-                    offers = ob.get("offers")
-                elif isinstance(ob.get("result"), list):
-                    offers = ob.get("result")
-                elif isinstance(ob.get("list"), list):
-                    offers = ob.get("list")
+            offers = combined["raw"].get("offerbyvin_parsed") or find_offers_list(combined["raw"].get("offerbyvin",{}).get("result",{})) or []
             if offers:
                 combined["raw"]["offerbyvin_parsed"] = offers
                 ah["offerbyvin_full"]["offers"] = offers
-                found_plate = None
                 found_pts = None
                 found_sts = None
                 for off in offers:
                     if not isinstance(off, dict):
                         continue
-                    plate = off.get("plate") or off.get("gosnomer") or off.get("regNum") or off.get("number") or ""
-                    if plate and not found_plate:
-                        import re as _re
-                        if _re.search(r'[АВЕКМНОРСТУХA-Z0-9]{2,}', str(plate).upper()):
-                            found_plate = str(plate).strip()
                     pts = off.get("ptsNumber") or off.get("pts") or off.get("vehiclePassportNumber") or ""
-                    if pts and not found_pts:
-                        found_pts = str(pts)
+                    if pts and not ah.get("pts"):
+                        ah["pts"] = str(pts)
                     sts = off.get("stsNumber") or off.get("sts") or ""
-                    if sts and not found_sts:
-                        found_sts = str(sts)
-                if found_plate and (not actual_reg or actual_reg == "не указан"):
-                    actual_reg = found_plate
-                    combined["meta"]["reg"] = found_plate
-                    LAST_REQUEST["reg"] = found_plate
-                    ah["gos"] = found_plate
-                    logs.append(f"offerbyvin found plate {found_plate}")
-                if found_pts and not ah.get("pts"):
-                    ah["pts"] = found_pts
-                if found_sts and not ah.get("sts"):
-                    ah["sts"] = found_sts
-                # 2. Пробег из объявлений с подписью источника
+                    if sts and not ah.get("sts"):
+                        ah["sts"] = str(sts)
+                # Пробег из объявлений с подписью источника
                 for off in offers:
                     if not isinstance(off, dict):
                         continue
-                    d = off.get("date") or off.get("publishDate") or off.get("created") or ""
+                    d = parse_eaisto_date(off.get("date") or off.get("publishDate") or off.get("created") or "")
                     m = off.get("mileage") or off.get("probeg") or off.get("odometer") or 0
                     try:
                         m_int = int(str(m).replace(" ", "").replace("км","").strip() or 0)
                         if m_int > 0:
-                            combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"Авито offerbyvin {off.get('city','')} {off.get('price','')}₽"})
+                            # check if already exists to avoid duplicates
+                            if not any(abs(x.get("Probeg",0)-m_int)<100 for x in combined["probeg"] if isinstance(x, dict)):
+                                combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"Авито {off.get('city','')} {off.get('price','')}₽"})
                     except:
                         pass
                 ah["sales_history"] = len(offers)
@@ -475,7 +616,7 @@ async def check_history(vin, reg_num=None):
                                 if len(combined["all_b64"]) >= 15:
                                     break
                                 b64 = await download_image_any(str(img_url))
-                                item = {"source": "offerbyvin", "price": "Авито", "type": f"Объявление {off.get('date','')}", "date": off.get("date",""), "url": str(img_url)[:200], "desc": f"Авито {off.get('price','')} {off.get('mileage','')}км {off.get('city','')}"}
+                                item = {"source": "offerbyvin", "price": "Авито", "type": f"Объявление {off.get('date','')}", "date": parse_eaisto_date(off.get("date","")), "url": str(img_url)[:200], "desc": f"Авито {off.get('price','')} {off.get('mileage','')}км {off.get('city','')}"}
                                 if b64:
                                     item["b64"] = b64
                                     combined["all_b64"].append(b64)
@@ -483,33 +624,36 @@ async def check_history(vin, reg_num=None):
         except Exception as e:
             logs.append(f"offerbyvin parse err {e}")
 
-        # 2. eaisto - пробег с подписью источника
+        # 2. eaisto - пробег с подписью источника - robust
         try:
             ea_raw = combined["raw"].get("eaisto",{}).get("result",{})
             ea_inner = ea_raw.get("eaisto") or ea_raw.get("result") or ea_raw
             if isinstance(ea_inner, dict):
                 cards = ea_inner.get("cards") or ea_inner.get("list") or ea_inner.get("result") or []
-                if isinstance(cards, list):
+                if isinstance(cards, list) and len(cards)>0:
                     for c in cards[:10]:
                         if not isinstance(c, dict):
                             continue
-                        d = c.get("date") or c.get("issueDate") or c.get("validFrom") or ""
+                        d_raw = c.get("date") or c.get("issueDate") or c.get("validFrom") or c.get("from") or ""
+                        d = parse_eaisto_date(d_raw)
                         m = c.get("mileage") or c.get("odometer") or c.get("probeg") or 0
                         try:
                             m_int = int(str(m).replace(" ","").replace("км","") or 0)
                             if m_int>0:
                                 combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": f"ЕАИСТО ТО {c.get('operator','')}"})
-                                ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": c.get("operator",""), "validTo": c.get("validTo","")})
+                                ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": c.get("operator",""), "validTo": parse_eaisto_date(c.get("validTo",""))})
                         except:
                             pass
-                # одиночная запись
-                if not cards:
-                    d = ea_inner.get("date") or ea_inner.get("issueDate") or ""
-                    m = ea_inner.get("mileage") or ea_inner.get("probeg") or 0
+                else:
+                    # одиночная запись
+                    d_raw = ea_inner.get("date") or ea_inner.get("issueDate") or ea_inner.get("from") or ""
+                    d = parse_eaisto_date(d_raw)
+                    m = ea_inner.get("mileage") or ea_inner.get("probeg") or ea_inner.get("odometer") or 0
                     try:
                         m_int = int(str(m).replace(" ","") or 0)
                         if m_int>0:
                             combined["probeg"].append({"DateString": str(d), "Probeg": m_int, "Source": "ЕАИСТО ТО"})
+                            ah["eaisto"]["cards"].append({"date": str(d), "mileage": m_int, "operator": ea_inner.get("operator","")})
                     except:
                         pass
         except Exception as e:
@@ -568,13 +712,32 @@ async def check_history(vin, reg_num=None):
         except:
             pass
 
-        # если все еще пусто — честно
         if not ah.get("pts"):
             ah["pts"] = "Нет данных в базах"
         if not ah.get("sts"):
             ah["sts"] = "Нет данных в базах"
-        if not ah.get("model"):
-            ah["model"] = f"Авто {vin[:8]}"
+        if not ah.get("model") or ah.get("model") == f"Авто {vin[:8]}":
+            # fallback по WMI - первые 3 символа VIN
+            wmi = vin[:3].upper()
+            wmi_map = {
+                "WF0": "FORD", "WFO": "FORD", "W0L": "OPEL", "W0V": "OPEL", "WBA": "BMW", "WBS": "BMW", "WDB": "MERCEDES", "WDC": "MERCEDES",
+                "ZAM": "MASERATI", "ZFA": "FIAT", "ZFF": "FERRARI", "WVW": "VOLKSWAGEN", "WAU": "AUDI", "TRU": "AUDI",
+                "TMB": "SKODA", "VSS": "SEAT", "1HG": "HONDA", "2HG": "HONDA", "JHM": "HONDA", "JT": "TOYOTA", "VF": "RENAULT/PEUGEOT/CITROEN"
+            }
+            brand_fallback = wmi_map.get(wmi, "")
+            # попробуем вытащить модель из vindecode raw даже если парсинг не сработал - ищем слова
+            raw_str = str(combined["raw"].get("vindecode",{}))[:5000]
+            # если в raw есть "FUSION" или "FOCUS" и тд
+            import re as _re
+            m = _re.search(r'"model"\s*:\s*"([^"]+)"', raw_str, _re.IGNORECASE)
+            model_fallback = m.group(1) if m else ""
+            m2 = _re.search(r'"brand"\s*:\s*"([^"]+)"', raw_str, _re.IGNORECASE)
+            brand_fallback2 = m2.group(1) if m2 else brand_fallback
+            if brand_fallback2 or model_fallback:
+                ah["model"] = f"{brand_fallback2} {model_fallback}".strip() or ah.get("model")
+            else:
+                ah["model"] = f"Авто {vin[:8]} ({brand_fallback})" if brand_fallback else f"Авто {vin[:8]}"
+            logs.append(f"vindecode fallback used: wmi {wmi} -> {ah['model']} raw snippet {raw_str[:200]}")
         if not ah.get("color"):
             ah["color"] = "Нет данных"
         if not ah.get("engine_vol"):
@@ -583,11 +746,12 @@ async def check_history(vin, reg_num=None):
             ah["type"] = "Легковой"
 
     except Exception as e:
-        logs.append(f"enrich FULL err {e}")
+        logs.append(f"enrich FULL err {e} {__import__('traceback').format_exc()[:500]}")
 
     global LAST_REPORT_DATA
     LAST_REPORT_DATA = combined
     return combined
+
 
 def generate_history_html(target, data):
     """v62 FULL - NO HARDCODE - все 9 источников"""
@@ -624,17 +788,33 @@ def generate_history_html(target, data):
         def parse_date(s):
             import re as re2
             try:
-                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d"]:
+                # timestamp int or string like 1655510400
+                if isinstance(s, int):
+                    return datetime.fromtimestamp(s)
+                s_str = str(s).strip()
+                if s_str.isdigit() and len(s_str) == 10:
                     try:
-                        return datetime.strptime(str(s).strip()[:19], fmt)
+                        return datetime.fromtimestamp(int(s_str))
                     except:
                         pass
-                m = re2.search(r'(\d{2})\.(\d{2})\.(\d{4})', str(s))
+                for fmt in ["%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"]:
+                    try:
+                        return datetime.strptime(s_str[:19], fmt)
+                    except:
+                        pass
+                m = re2.search(r'(\d{2})\.(\d{2})\.(\d{4})', s_str)
                 if m:
                     return datetime.strptime(f"{m.group(1)}.{m.group(2)}.{m.group(3)}", "%d.%m.%Y")
-                m2 = re2.search(r'(\d{4})-(\d{2})-(\d{2})', str(s))
+                m2 = re2.search(r'(\d{4})-(\d{2})-(\d{2})', s_str)
                 if m2:
                     return datetime.strptime(f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}", "%Y-%m-%d")
+                # try unix timestamp inside string
+                m3 = re2.search(r'(\d{10})', s_str)
+                if m3:
+                    try:
+                        return datetime.fromtimestamp(int(m3.group(1)))
+                    except:
+                        pass
             except:
                 pass
             return datetime.min
@@ -691,7 +871,22 @@ def generate_history_html(target, data):
     if probeg_sorted:
         try:
             vals = [p[2] for p in probeg_sorted[-7:]]
-            dates = [p[1][:10] for p in probeg_sorted[-7:]]
+            # use human readable dates for graph
+            def human_date_for_graph(d_str):
+                try:
+                    # if timestamp, convert
+                    s = str(d_str).strip()
+                    if s.isdigit() and len(s)==10:
+                        return datetime.fromtimestamp(int(s)).strftime("%d.%m")
+                    # try parse
+                    import re as _re
+                    m = _re.search(r'(\d{2})\.(\d{2})\.(\d{4})', s)
+                    if m:
+                        return f"{m.group(1)}.{m.group(2)}"
+                    return s[:5]
+                except:
+                    return str(d_str)[:5]
+            dates = [human_date_for_graph(p[1]) for p in probeg_sorted[-7:]]
             max_v = max(vals) if vals else 1
             min_v = min(vals) if vals else 0
             rng = max_v - min_v or 1
@@ -1223,6 +1418,45 @@ RAW offerbyvin: {offer_raw}
 """
     return prompt
 
+def generate_logs_file(data):
+    import json
+    meta = data.get("meta",{})
+    logs = data.get("logs",[])
+    raw = data.get("raw",{})
+    auto = data.get("autoteka_hard",{})
+    probeg = data.get("probeg",[])
+    vin = meta.get("vin","")
+    reg = meta.get("reg","")
+    txt = f"VIN: {vin} REG: {reg}\n"
+    txt += f"Дата: {__import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+    txt += "BOOT: v62 FULL 9 SOURCES\n\n"
+    txt += "=== ЛОГИ ЗАПРОСОВ ===\n"
+    txt += "\n".join(logs) + "\n\n"
+    txt += "=== АВТОТЕКА HARD ===\n"
+    try:
+        txt += f"model: {auto.get('model')} year: {auto.get('year')} color: {auto.get('color')} pts: {auto.get('pts')} sts: {auto.get('sts')}\n"
+        txt += f"owners: {auto.get('owners')} dtp: {auto.get('dtp_count')} sales: {auto.get('sales_history')}\n"
+        txt += f"taxi: {auto.get('taxi')} carsharing: {auto.get('carsharing')}\n"
+        txt += f"probeg: {len(probeg)}\n"
+        for p in probeg[:15]:
+            txt += f"  {p}\n"
+    except Exception as e:
+        txt += f"err {e}\n"
+    txt += "\n=== RAW JSON ===\n"
+    for src in ["vindecode","offerbyvin","eaisto","probeg2","gibdd","zalog","dtp","osago","carsharing","taxi","pic_vin","nomerogram","autophoto"]:
+        try:
+            r = raw.get(src)
+            if not r:
+                txt += f"{src}: НЕТ\n"
+                continue
+            result = r.get("result",{})
+            txt += f"\n--- {src} --- keys: {list(result.keys())[:20] if isinstance(result, dict) else type(result)}\n"
+            snippet = json.dumps(result, ensure_ascii=False, indent=2)[:3000]
+            txt += snippet + "\n"
+        except Exception as e:
+            txt += f"{src} err {e}\n"
+    return txt
+
 def generate_kapot_html():
     html = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Проверка у капота</title></head>
@@ -1250,7 +1484,8 @@ dp = Dispatcher()
 def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="1️⃣ Проверка истории авто по VIN"), KeyboardButton(text="2️⃣ Предварительные рекомендации ИИ")],
-        [KeyboardButton(text="3️⃣ Проверка у капота"), KeyboardButton(text="🔄 Пересобрать визуал")]
+        [KeyboardButton(text="3️⃣ Проверка у капота"), KeyboardButton(text="📋 Логи Apipoint")],
+        [KeyboardButton(text="🔄 Пересобрать визуал")]
     ], resize_keyboard=True)
 
 @dp.message(Command("start"))
@@ -1367,6 +1602,17 @@ async def handle(m: types.Message):
         await m.answer_document(file, caption=caption[:1000], reply_markup=main_kb())
         return
 
+    if "логи apipoint" in txt_low or txt_low.startswith("📋"):
+        data = LAST_REPORT_DATA
+        if not data or not data.get("meta"):
+            await m.answer("Нет последнего отчета в памяти (бот перезапускался). Пришли VIN чтобы собрать отчет и логи.", reply_markup=main_kb())
+            return
+        vin = data.get("meta",{}).get("vin","unknown")
+        logs_txt = generate_logs_file(data)
+        file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v62_FULL.txt")
+        await m.answer_document(file_logs, caption=f"📋 Логи Apipoint для {vin} • {data.get('meta',{}).get('reg')} • 9 источников • Кинь этот файл мне", reply_markup=main_kb())
+        return
+
     if "проверка истории" in txt_low or "истории авто" in txt_low or txt_low.startswith("1️⃣") or mm_vin:
         if mm_vin:
             vin = mm_vin.group(0)
@@ -1375,6 +1621,12 @@ async def handle(m: types.Message):
             html = generate_history_html(vin, data)
             file = BufferedInputFile(html.encode('utf-8'), filename=f"History_{vin}_v62_FULL.html")
             await m.answer_document(file, caption=f"1️⃣ FULL История {vin} • {data.get('meta',{}).get('reg')} • {len(data.get('all_b64',[]))} фото • 9 источников • Теперь 2️⃣ возьмет этот отчет без доп. оплаты", reply_markup=main_kb())
+            try:
+                logs_txt = generate_logs_file(data)
+                file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v62_FULL.txt")
+                await m.answer_document(file_logs, caption=f"📋 Логи для {vin} — кинь мне этот файл если что-то не подтянулось", reply_markup=main_kb())
+            except Exception as e:
+                await m.answer(f"⚠️ Не смог собрать логи: {e}")
             return
         if txt_low.startswith("1️⃣"):
             await m.answer("Пришли VIN для проверки истории (Кнопка 1)", reply_markup=main_kb())
