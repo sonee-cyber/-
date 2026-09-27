@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-v65.8 - ТЕКУЩИЙ ГОС В КАРТОЧКУ + ВСЕ ГОС ДЛЯ ОБЪЯВЛЕНИЙ
+v66.1 - ТЕКУЩИЙ ГОС В КАРТОЧКУ + ВСЕ ГОС ДЛЯ ОБЪЯВЛЕНИЙ
 - Карточка = строго по VIN (vindecode по VIN), но текущий госномер = самый свежий из всех источников
 - Объявления = по ВСЕМ гос что находим (ТО eaisto, pic, offerbyvin, servicemaintenance, vin2number)
 - servicemaintenance 26.3₽, gai 21₽, gibddhistory 2.1₽, autophoto 1.6₽
@@ -36,7 +36,7 @@ if not BOT_TOKEN:
 if not APIPOINT_KEY:
     raise RuntimeError("Нет APIPOINT_KEY")
 
-print(f"BOOT v65.8 CURRENT GOS IN CARD + ALL GOS FOR ADS model={OPENROUTER_MODEL} pil={HAS_PIL}")
+print(f"BOOT v66.1 CURRENT GOS IN CARD + ALL GOS FOR ADS model={OPENROUTER_MODEL} pil={HAS_PIL}")
 
 USER_DATA: Dict[int, Dict[str, Any]] = {}
 CACHE: Dict[str, Tuple[float, Any]] = {}
@@ -434,7 +434,7 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
         "autoteka_hard": get_autoteka_hard_for_vin(vin or original_input, reg_num)
     }
     logs = combined["logs"]
-    logs.append(f"START v65.8 uid={user_id} vin={vin} reg={reg_num} input={original_input} is_frame={is_input_frame}")
+    logs.append(f"START v66.1 uid={user_id} vin={vin} reg={reg_num} input={original_input} is_frame={is_input_frame}")
 
     # --- Для сбора всех гос и определения текущего ---
     all_gos_found = set()
@@ -492,7 +492,7 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
         except Exception as e:
             logs.append(f"frameapi exc {e}")
 
-    first_sources = ["vindecode","offerbyvin","eaisto","probeg","probeg2","gibdd","zalog","dtp","osago","carsharing","taxi","servicemaintenance","gai","gibddhistory"]
+    first_sources = ["vindecode","offerbyvin","eaisto","probeg","probeg2","gibdd","zalog","dtp","osago","carsharing","taxi","servicemaintenance","gai","gibddhistory","elpts"]
     tasks = []
     if vin:
         tasks.append(fetch_one("pic_vin", {"sources": "pic", "vin": vin}))
@@ -730,7 +730,7 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
     combined["autoteka_hard"]["vin2number"]["list"] = list(all_gos_found)
     logs.append(f"ИТОГО госномеров для объявлений: {list(all_gos_found)} | текущий в карточку: {current_gos}")
 
-    # Этап 2: по госномеру - объявления по ВСЕМ гос, остальное по текущему
+    # Этап 2: по госномеру - объявления по ВСЕМ гос, остальное по текущему + ПТС/СТС
     second_tasks = []
     if all_gos_found:
         for idx, gos in enumerate(list(all_gos_found)[:5]):
@@ -744,6 +744,7 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
             second_tasks.append(fetch_one("pic_gos", {"sources": "pic", "gosnomer": actual_reg}))
             second_tasks.append(fetch_one("nomerogram", {"sources": "nomerogram", "regNum": actual_reg}))
             second_tasks.append(fetch_one("autophoto", {"sources": "autophoto", "regNum": actual_reg}))
+            second_tasks.append(fetch_one("number2sts", {"sources": "number2sts", "number": actual_reg, "mode": "single"}))
     elif actual_reg and actual_reg != "не указан":
         second_tasks.append(fetch_one("offerbyvin_by_reg", {"sources": "offerbyvin", "regNum": actual_reg}))
         second_tasks.append(fetch_one("offerbygosnum", {"sources": "offerbygosnum", "gosnumber": actual_reg}))
@@ -754,6 +755,7 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
         second_tasks.append(fetch_one("pic_gos", {"sources": "pic", "gosnomer": actual_reg}))
         second_tasks.append(fetch_one("nomerogram", {"sources": "nomerogram", "regNum": actual_reg}))
         second_tasks.append(fetch_one("autophoto", {"sources": "autophoto", "regNum": actual_reg}))
+        second_tasks.append(fetch_one("number2sts", {"sources": "number2sts", "number": actual_reg, "mode": "single"}))
 
     if second_tasks:
         second_results = await asyncio.gather(*second_tasks, return_exceptions=True)
@@ -784,6 +786,28 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
                 base = name.split("_by_reg")[0]
                 if not combined["raw"].get(base) or not combined["raw"].get(base,{}).get("result"):
                     combined["raw"][base] = data
+
+    # Этап 2б: если получили СТС из number2sts — добиваем getpts 5.30₽ для ПТС
+    try:
+        n2s_data = combined["raw"].get("number2sts",{}).get("result",{})
+        sts_number = None
+        if isinstance(n2s_data, dict):
+            inner = n2s_data.get("number2sts") or n2s_data.get("result") or n2s_data
+            if isinstance(inner, dict):
+                sts_number = inner.get("sts") or inner.get("stsNumber") or inner.get("number") or inner.get("ctc") or inner.get("stc")
+            elif isinstance(inner, list) and inner:
+                first = inner[0] if isinstance(inner[0], dict) else {}
+                sts_number = first.get("sts") or first.get("number")
+        if sts_number and actual_reg:
+            import re
+            sts_clean = re.sub(r"\D", "", str(sts_number))
+            if len(sts_clean)>=10:
+                logs.append(f"number2sts дал СТС {sts_clean[:4]}...{sts_clean[-4:]} — бью getpts 5.30₽")
+                st_g, data_g, _ = await apipoint_call({"sources": "getpts", "gosnumber": actual_reg, "sts": sts_clean}, use_cache=False)
+                combined["raw"]["getpts"] = data_g
+                logs.append(f"getpts -> {st_g}")
+    except Exception as e:
+        logs.append(f"getpts err {e}")
 
     # Фото
     photo_urls = []
@@ -965,12 +989,27 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
         try:
             gai_raw = combined["raw"].get("gai",{}).get("result",{})
             gai_inner = gai_raw.get("gai") or gai_raw.get("result") or gai_raw
+            data_block = None
             if isinstance(gai_inner, dict):
+                data_block = gai_inner.get("data") if isinstance(gai_inner.get("data"), dict) else None
+                owners_list = None
                 if isinstance(gai_inner.get("ownershipPeriods"), list):
-                    ah["gai"]["owners"] = gai_inner.get("ownershipPeriods")
-                    ah["gai"]["count_owners"] = len(gai_inner.get("ownershipPeriods"))
+                    owners_list = gai_inner.get("ownershipPeriods")
+                elif isinstance(gai_inner.get("History"), list):
+                    owners_list = gai_inner.get("History")
+                elif data_block and isinstance(data_block.get("History"), list):
+                    owners_list = data_block.get("History")
+                if owners_list:
+                    ah["gai"]["owners"] = owners_list
+                    ah["gai"]["count_owners"] = len(owners_list)
                     if not ah["owners"]:
-                        ah["owners"] = len(gai_inner.get("ownershipPeriods"))
+                        ah["owners"] = len(owners_list)
+                    if data_block and data_block.get("Color"):
+                        ah["color"] = data_block.get("Color")
+                        combined["meta"]["color"] = data_block.get("Color")
+                    if data_block and data_block.get("Marka"):
+                        if not ah["model"]:
+                            ah["model"] = f"{data_block.get('Marka')} {data_block.get('MarkaModel','')}".strip()
                 if isinstance(gai_inner.get("restrictions"), list):
                     ah["gai"]["restrictions"] = gai_inner.get("restrictions")
                     if gai_inner.get("restrictions"):
@@ -983,6 +1022,8 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
                         ah["juridical"]["розыск"] = f"GAI: в розыске {len(gai_inner.get('wanted'))}"
                 if isinstance(gai_inner.get("registrationHistory"), list):
                     ah["gai"]["reg_history"] = gai_inner.get("registrationHistory")
+                if data_block and isinstance(data_block.get("History"), list):
+                    ah["gai"]["reg_history"] = data_block.get("History")
         except Exception as e:
             logs.append(f"gai parse err {e}")
 
@@ -990,11 +1031,34 @@ async def check_history(vin: str, reg_num: Optional[str] = None, user_id: Option
             gh_raw = combined["raw"].get("gibddhistory",{}).get("result",{})
             gh_inner = gh_raw.get("gibddhistory") or gh_raw.get("result") or gh_raw
             records = []
+            if isinstance(gh_inner, str):
+                try:
+                    import json as _json
+                    parsed = _json.loads(gh_inner)
+                    gh_inner = parsed
+                except: pass
             if isinstance(gh_inner, dict):
-                if isinstance(gh_inner.get("list"), list): records = gh_inner.get("list")
-                elif isinstance(gh_inner.get("history"), list): records = gh_inner.get("history")
-                elif isinstance(gh_inner.get("result"), list): records = gh_inner.get("result")
-                elif isinstance(gh_inner.get("ownershipPeriods"), list): records = gh_inner.get("ownershipPeriods")
+                if isinstance(gh_inner.get("result"), str):
+                    try:
+                        import json as _json2
+                        parsed2 = _json2.loads(gh_inner.get("result"))
+                        if isinstance(parsed2, dict):
+                            req = parsed2.get("RequestResult") or {}
+                            if isinstance(req.get("periods"), list):
+                                records = req.get("periods")
+                            elif isinstance(parsed2.get("periods"), list):
+                                records = parsed2.get("periods")
+                    except: pass
+                if not records:
+                    if isinstance(gh_inner.get("list"), list): records = gh_inner.get("list")
+                    elif isinstance(gh_inner.get("history"), list): records = gh_inner.get("history")
+                    elif isinstance(gh_inner.get("result"), list): records = gh_inner.get("result")
+                    elif isinstance(gh_inner.get("ownershipPeriods"), list): records = gh_inner.get("ownershipPeriods")
+                    elif isinstance(gh_inner.get("periods"), list): records = gh_inner.get("periods")
+                    else:
+                        rr = gh_inner.get("RequestResult") or {}
+                        if isinstance(rr.get("periods"), list):
+                            records = rr.get("periods")
             elif isinstance(gh_inner, list):
                 records = gh_inner
             ah["gibddhistory"]["records"] = records[:30]
@@ -1161,15 +1225,19 @@ def generate_history_html(target, data):
         def parse_sort(s):
             if not s: return datetime.min
             s = str(s).strip()[:19]
-            # пробуем разные форматы
             for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M"):
                 try:
-                    return datetime.strptime(s[:len(fmt)], fmt)
-                except: pass
-            # timestamp
+                    return datetime.strptime(s, fmt)
+                except: 
+                    pass
+                try:
+                    # пробуем обрезать до длины формата без % (костыль)
+                    return datetime.strptime(s[:10], "%d.%m.%Y")
+                except:
+                    pass
             try:
-                if s.isdigit() and len(s)>=10:
-                    return datetime.fromtimestamp(int(s[:10]))
+                if str(s).isdigit() and len(str(s))>=10:
+                    return datetime.fromtimestamp(int(str(s)[:10]))
             except: pass
             return datetime.min
 
@@ -1234,9 +1302,168 @@ def generate_history_html(target, data):
     else:
         service_html = '<div style="font-size:11px;color:#6b7280">Нет данных дилерского ТО</div>'
 
+    # Владельцы из gai / gibddhistory — с расшифровкой периода владения
+    def parse_owner_date(s):
+        if not s: return None
+        s = str(s).strip()[:10]
+        if s.lower() in ("н.в.", "н.в", "now", "наст.вр.", "текущий"): return datetime.now()
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y", "%Y/%m/%d", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(s[:10], fmt)
+            except: pass
+        # timestamp
+        try:
+            if s.isdigit() and len(s)>=8:
+                return datetime.fromtimestamp(int(s[:10]))
+        except: pass
+        return None
+
+    def format_duration(from_dt, to_dt):
+        if not from_dt or not to_dt: return ""
+        try:
+            # пробуем точный расчет через relativedelta
+            try:
+                from dateutil.relativedelta import relativedelta
+                rd = relativedelta(to_dt, from_dt)
+                y = rd.years
+                m = rd.months
+                d = rd.days
+                delta_days = (to_dt - from_dt).days
+                if delta_days < 0: delta_days = 0
+                txt = ""
+                if y>0:
+                    if y%10==1 and y%100!=11: txt+=f"{y} год "
+                    elif 2<=y%10<=4 and not 12<=y%100<=14: txt+=f"{y} года "
+                    else: txt+=f"{y} лет "
+                if m>0:
+                    txt+=f"{m} мес "
+                if d>0 and y==0:
+                    txt+=f"{d} дн "
+                if not txt:
+                    txt = f"{delta_days} дн "
+                return txt.strip()
+            except:
+                # fallback простой
+                delta_days = (to_dt - from_dt).days
+                if delta_days < 0: delta_days = 0
+                years = delta_days // 365
+                rem = delta_days % 365
+                months = rem // 30
+                txt = ""
+                if years>0:
+                    if years%10==1 and years%100!=11: txt+=f"{years} год "
+                    elif 2<=years%10<=4 and not 12<=years%100<=14: txt+=f"{years} года "
+                    else: txt+=f"{years} лет "
+                if months>0:
+                    txt+=f"{months} мес "
+                if not txt:
+                    txt = f"{delta_days} дн "
+                return txt.strip()
+        except Exception as e:
+            return ""
+
+    owners_list = auto.get("gai",{}).get("owners") or auto.get("gibddhistory",{}).get("records") or auto.get("gibdd",{}).get("owners") or []
+    owners_html = ""
+    if owners_list:
+        parts = []
+        for idx, own in enumerate(owners_list[:10]):
+            if not isinstance(own, dict): continue
+            from_raw = own.get("From") or own.get("from") or own.get("startDate") or own.get("StartDate") or own.get("simpleDateFrom") or ""
+            to_raw = own.get("To") or own.get("to") or own.get("endDate") or own.get("EndDate") or own.get("simpleDateTo") or "н.в."
+            ptype = own.get("PersonType") or own.get("ownerType") or own.get("personType") or own.get("lastOwnerType") or "физлицо"
+            # gai иногда хранит From/To внутри, а также From/To как строки
+            if not from_raw:
+                from_raw = own.get("from") or ""
+            from_dt = parse_owner_date(from_raw)
+            to_dt = parse_owner_date(to_raw)
+            if to_raw and str(to_raw).lower().startswith("н.в"): to_dt = datetime.now()
+            duration_txt = format_duration(from_dt, to_dt) if from_dt and to_dt else ""
+            # красиво форматируем даты
+            from_show = html_lib.escape(str(from_raw)[:10]) if from_raw else "?"
+            to_show = html_lib.escape(str(to_raw)[:10]) if str(to_raw).lower() not in ("н.в.", "н.в") else "н.в."
+            # если to_raw н.в. — показываем н.в.
+            if str(to_raw).lower().startswith("н.в"):
+                to_show = "н.в."
+            parts.append(f'<div style="font-size:11px;padding:8px 0;border-bottom:1px solid #f2f2f7"><b>{idx+1}-й владелец:</b> {from_show} — {to_show}<br><span style="color:#6b7280">⏱ {html_lib.escape(duration_txt)} • {html_lib.escape(str(ptype)[:30])}</span></div>')
+        owners_html = "".join(parts) if parts else '<div style="font-size:11px;color:#6b7280">Нет данных</div>'
+    else:
+        owners_html = '<div style="font-size:11px;color:#6b7280">Нет данных о владельцах (gai/gibddhistory 500 в этом прогоне, но в v65.6 было 3 владельца — см. Авито)</div>'
+
+    # ЕАИСТО блок
+    eaisto_raw = raw.get("eaisto",{}).get("result",{})
+    eaisto_inner = eaisto_raw.get("eaisto") or eaisto_raw.get("result") or eaisto_raw
+    eaisto_cards = []
+    if isinstance(eaisto_inner, dict):
+        eaisto_cards = eaisto_inner.get("result") or eaisto_inner.get("list") or eaisto_inner.get("cards") or []
+    elif isinstance(eaisto_inner, list):
+        eaisto_cards = eaisto_inner
+    eaisto_html = ""
+    if eaisto_cards:
+        parts = []
+        for c in eaisto_cards[:10]:
+            if not isinstance(c, dict): continue
+            ds = c.get("datestring") or c.get("dateString") or c.get("date") or ""
+            prob = c.get("probeg") or c.get("mileage") or ""
+            gos = c.get("gosnumber") or c.get("gosnomer") or ""
+            doc = c.get("docname") or "Диаг.карта"
+            parts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>{html_lib.escape(str(ds)[:10])}</b> • {prob} км • {html_lib.escape(str(gos)[:12])} • {html_lib.escape(str(doc)[:20])}</div>')
+        eaisto_html = "".join(parts)
+    else:
+        eaisto_html = '<div style="font-size:11px;color:#6b7280">Нет карт ТО</div>'
+
+    # ПТС / СТС / ЭПТС блок — из number2sts + getpts + elpts
+    pts_html = ""
+    try:
+        n2s_raw = raw.get("number2sts",{}).get("result",{})
+        n2s_inner = n2s_raw.get("number2sts") or n2s_raw.get("result") or n2s_raw
+        getpts_raw = raw.get("getpts",{}).get("result",{})
+        getpts_inner = getpts_raw.get("getpts") or getpts_raw.get("result") or getpts_raw
+        elpts_raw = raw.get("elpts",{}).get("result",{})
+        elpts_inner = elpts_raw.get("elpts") or elpts_raw.get("result") or elpts_raw
+
+        parts_pts = []
+        if isinstance(n2s_inner, dict) and (n2s_inner.get("sts") or n2s_inner.get("number")):
+            sts_val = n2s_inner.get("sts") or n2s_inner.get("number") or n2s_inner.get("ctc") or ""
+            gos_val = n2s_inner.get("gosnumber") or n2s_inner.get("number") or current_gos
+            parts_pts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>СТС по гос {html_lib.escape(str(gos_val)[:12])}:</b> {html_lib.escape(str(sts_val)[:20])} (number2sts 2.00₽)</div>')
+        elif isinstance(n2s_inner, list) and n2s_inner:
+            for it in n2s_inner[:3]:
+                if isinstance(it, dict):
+                    sts_val = it.get("sts") or it.get("number") or ""
+                    parts_pts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>СТС:</b> {html_lib.escape(str(sts_val)[:20])}</div>')
+
+        if isinstance(getpts_inner, dict) and (getpts_inner.get("pts") or getpts_inner.get("series") or getpts_inner.get("number")):
+            ser = getpts_inner.get("series") or getpts_inner.get("seria") or ""
+            num = getpts_inner.get("number") or getpts_inner.get("pts") or ""
+            date = getpts_inner.get("date") or getpts_inner.get("issueDate") or ""
+            sts_cur = getpts_inner.get("sts") or getpts_inner.get("currentSts") or ""
+            parts_pts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>ПТС (getpts 5.30₽):</b> {html_lib.escape(str(ser))} {html_lib.escape(str(num))} от {html_lib.escape(str(date)[:10])}<br>Текущий СТС: {html_lib.escape(str(sts_cur)[:20])}</div>')
+        elif isinstance(getpts_inner, dict) and getpts_inner:
+            # выводим сырые поля если структура другая
+            dump = ", ".join([f"{k}={str(v)[:20]}" for k,v in list(getpts_inner.items())[:6]])
+            if dump:
+                parts_pts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>getpts:</b> {html_lib.escape(dump)}</div>')
+
+        if isinstance(elpts_inner, dict) and elpts_inner:
+            status = elpts_inner.get("status") or elpts_inner.get("state") or ""
+            util = elpts_inner.get("utilizationFee") or elpts_inner.get("uFee") or ""
+            last_reg = elpts_inner.get("lastRegistration") or elpts_inner.get("lastAction") or ""
+            parts_pts.append(f'<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #f2f2f7"><b>ЭПТС (elpts 1.20₽):</b> статус {html_lib.escape(str(status)[:20])} • утил.сбор {html_lib.escape(str(util)[:20])}<br>Посл.рег: {html_lib.escape(str(last_reg)[:40])}</div>')
+            if not parts_pts:
+                # если elpts пустой, но есть данные
+                dump2 = ", ".join([f"{k}={str(v)[:20]}" for k,v in list(elpts_inner.items())[:6]])
+                parts_pts.append(f'<div style="font-size:11px;padding:6px 0">{html_lib.escape(dump2)}</div>')
+
+        if parts_pts:
+            pts_html = "".join(parts_pts)
+        else:
+            pts_html = '<div style="font-size:11px;color:#6b7280">Нет данных ПТС/СТС (number2sts 2₽ вернул пусто, getpts 5.3₽ требует СТС, elpts 1.2₽ — для ЭПТС, для 2008 авто ЭПТС может не быть). После добавления источников будут тут.</div>'
+    except Exception as e:
+        pts_html = f'<div style="font-size:11px;color:#ff3b30">Ошибка ПТС/СТС блока {html_lib.escape(str(e)[:80])}</div>'
+
     all_gos_html = "".join([f'<span style="background:#111;color:#fff;border-radius:999px;padding:6px 10px;font-size:10px;margin-right:4px">{html_lib.escape(g)}</span>' for g in all_gos[:6]])
 
-    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>История {html_lib.escape(vin)} v65.8</title>
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>История {html_lib.escape(vin)} v66.1</title>
 <style>*{{box-sizing:border-box;margin:0;padding:0}} body{{font-family:Manrope,sans-serif;background:#f2f2f7;color:#111}} .container{{max-width:440px;margin:0 auto;padding:12px;padding-bottom:40px}} .card{{background:#fff;border-radius:24px;padding:18px;border:1px solid #e5e5ea;margin-top:14px}} .pill{{display:inline-flex;padding:8px 14px;border-radius:999px;font-size:11px;font-weight:800}} .pill-red{{background:#ff3b30;color:#fff}} .pill-black{{background:#111;color:#fff}} .pill-gray{{background:#e5e7eb;color:#374151}} .pill-orange{{background:#ff9500;color:#fff}} .pill-green{{background:#34c759;color:#fff}} .blue-hero{{background:linear-gradient(180deg,#c7d2fe 0%,#dbeafe 40%,#eff6ff 100%);border-radius:28px;padding:18px;border:1px solid #bfdbfe}} .photo-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}} .photo-cell{{background:#f1f1f3;border-radius:16px;aspect-ratio:1;position:relative;overflow:hidden;border:1px solid #e5e5ea;display:flex;align-items:center;justify-content:center;padding:8px;text-align:center}} .photo-cell .year{{position:absolute;bottom:8px;left:8px;background:#111;color:#fff;font-size:11px;font-weight:700;padding:4px 8px;border-radius:999px}} .log{{font-family:monospace;font-size:9px;background:#f8f8fb;padding:10px;border-radius:12px;overflow:auto;max-height:140px;white-space:pre-wrap;color:#8e8e93;border:1px solid #efeff4}}</style></head><body><div class="container">
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
 <span class="pill {'pill-red' if skrutka else 'pill-gray'}">{html_lib.escape(skrutka_badge)}</span>
@@ -1258,15 +1485,21 @@ def generate_history_html(target, data):
 <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:4px">{all_gos_html}<span style="font-size:10px;color:#6b7280;margin-left:6px">все гос для объявлений ({len(all_gos)})</span></div>
 </div>
 
+<div class="card"><div style="font-weight:800;font-size:12px">👥 ВЛАДЕЛЬЦЫ • {owners} (из GAI/GIBDDHISTORY — есть в логах v65.6, в v66.1 GAI 500)</div><div style="margin-top:8px">{owners_html}</div></div>
+
+<div class="card"><div style="font-weight:800;font-size:12px">📋 ЕАИСТО • диаг.карты {len(eaisto_cards)} (есть в логах, раньше не выводили)</div><div style="margin-top:8px">{eaisto_html}</div></div>
+
 <div class="card"><div style="font-weight:800;font-size:12px">🔧 ДИЛЕРСКАЯ ИСТОРИЯ • {service_count} записей</div><div style="margin-top:8px">{service_html}</div></div>
 
 <div class="card"><div style="font-weight:800;font-size:12px">📸 ФОТО {total_photos}</div><div class="photo-grid">{photos_html}</div></div>
 
-<div class="card"><div style="font-weight:800;font-size:12px">📈 ПРОБЕГ {len(probeg_sorted)} записей (ЕАИСТО+probeg+probeg2+ТО+объявления+frameapi — один раздел)</div>
-{''.join([f'<div style="font-size:12px;padding:8px 0;border-bottom:1px solid #f2f2f7;display:flex;justify-content:space-between;align-items:center;gap:8px"><div><b>{html_lib.escape(str(d[1][:10]))}</b> • {d[2]} км</div><span style="font-size:10px;background:#f2f2f7;border-radius:999px;padding:4px 8px;color:#6b7280;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{html_lib.escape(str(d[3])[:60])}</span></div>' for d in reversed(probeg_sorted[-30:])]) if probeg_sorted else '<div style="font-size:12px;color:#6b7280">Нет записей</div>'}
+<div class="card"><div style="font-weight:800;font-size:12px">📈 ПРОБЕГ {len(probeg_sorted)} записей — ЕДИНЫЙ РАЗДЕЛ (ЕАИСТО+probeg+probeg2+ТО+объявления+frameapi), сортировка РАННЯЯ → ПОЗДНЯЯ</div>
+{''.join([f'<div style="font-size:12px;padding:8px 0;border-bottom:1px solid #f2f2f7;display:flex;justify-content:space-between;align-items:center;gap:8px"><div><b>{html_lib.escape(str(d[1][:10]))}</b> • {d[2]} км</div><span style="font-size:10px;background:#f2f2f7;border-radius:999px;padding:4px 8px;color:#6b7280;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{html_lib.escape(str(d[3])[:60])}</span></div>' for d in probeg_sorted]) if probeg_sorted else '<div style="font-size:12px;color:#6b7280">Нет записей</div>'}
 </div>
 
-<div class="card"><div class="log">{safe_logs}</div><div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">v65.8 CURRENT GOS={html_lib.escape(current_gos)} ALL={html_lib.escape(",".join(all_gos[:3]))} • {html_lib.escape(vin)}</div></div>
+<div class="card"><div style="font-weight:800;font-size:12px">📄 ПТС / СТС / ЭПТС — новые источники (помогут закрыть gap с Авито)</div><div style="margin-top:8px">{pts_html}</div></div>
+
+<div class="card"><div class="log">{safe_logs}</div><div style="font-size:9px;color:#8e8e93;margin-top:8px;text-align:center">v66.1 CURRENT GOS={html_lib.escape(current_gos)} ALL={html_lib.escape(",".join(all_gos[:3]))} • {html_lib.escape(vin)}</div></div>
 </div></body></html>"""
 
 def build_prompt_for_openrouter(data: Dict[str, Any]) -> str:
@@ -1325,16 +1558,16 @@ def generate_ai_recommendations_html(data, ai_text=None, ai_error=None):
         esc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', esc)
         return esc.replace('\n','<br>')
     ai_block = f'<div style="background:#111;color:#fff;border-radius:20px;padding:16px;margin-top:12px"><div style="font-size:11px;opacity:0.6">🧠 {OPENROUTER_MODEL} • ТЕКУЩИЙ ГОС {reg}</div><div style="font-size:13px;line-height:1.5;margin-top:10px">{format_ai(ai_text)}</div></div>' if ai_text else f'<div style="background:#ffeaea;padding:14px;border-radius:18px;margin-top:12px"><b>Ошибка ИИ:</b> {html_lib.escape(str(ai_error))[:600]}</div>' if ai_error else '<div style="background:#f2f2f7;padding:14px;border-radius:18px;margin-top:12px">Нет ключа ИИ</div>'
-    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ИИ {vin} {reg} v65.8</title><style>body{{font-family:Manrope,sans-serif;background:#f2f2f7;color:#111}} .container{{max-width:440px;margin:0 auto;padding:12px}} .card{{background:#fff;border-radius:24px;padding:18px;margin-top:14px;border:1px solid #e5e5ea}} .verdict{{background:{verdict_color};border-radius:28px;padding:18px;color:#fff}}</style></head><body><div class="container"><div class="verdict"><h1>{verdict_emoji} {verdict_title}</h1><div style="font-size:12px;opacity:0.85;margin-top:8px">{model_full} • ТЕКУЩИЙ {reg} • {vin}</div></div>{ai_block}</div></body></html>"""
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ИИ {vin} {reg} v66.1</title><style>body{{font-family:Manrope,sans-serif;background:#f2f2f7;color:#111}} .container{{max-width:440px;margin:0 auto;padding:12px}} .card{{background:#fff;border-radius:24px;padding:18px;margin-top:14px;border:1px solid #e5e5ea}} .verdict{{background:{verdict_color};border-radius:28px;padding:18px;color:#fff}}</style></head><body><div class="container"><div class="verdict"><h1>{verdict_emoji} {verdict_title}</h1><div style="font-size:12px;opacity:0.85;margin-top:8px">{model_full} • ТЕКУЩИЙ {reg} • {vin}</div></div>{ai_block}</div></body></html>"""
 
 def generate_kapot_html():
-    return """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Капот v65.8</title></head><body class="bg-[#f2f2f7]"><div class="max-w-[720px] mx-auto p-4"><div class="bg-white rounded-[24px] p-6 border"><div class="text-[11px] text-gray-400 tracking-widest">v65.8 CURRENT GOS</div><h1 class="text-[22px] font-bold mt-2">Проверка у капота</h1><div class="mt-6 space-y-3 text-sm"><div class="bg-green-50 border border-green-200 rounded-xl p-4"><div class="font-bold">✅ Текущий гос в карточку:</div><div class="text-xs mt-1">Теперь в карточке всегда текущий госномер (из vin2number комм.баз или последний по дате из ТО). А объявления ищем по всем гос что нашли.</div></div></div></div></div></body></html>"""
+    return """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Капот v66.1</title></head><body class="bg-[#f2f2f7]"><div class="max-w-[720px] mx-auto p-4"><div class="bg-white rounded-[24px] p-6 border"><div class="text-[11px] text-gray-400 tracking-widest">v66.1 CURRENT GOS</div><h1 class="text-[22px] font-bold mt-2">Проверка у капота</h1><div class="mt-6 space-y-3 text-sm"><div class="bg-green-50 border border-green-200 rounded-xl p-4"><div class="font-bold">✅ Текущий гос в карточку:</div><div class="text-xs mt-1">Теперь в карточке всегда текущий госномер (из vin2number комм.баз или последний по дате из ТО). А объявления ищем по всем гос что нашли.</div></div></div></div></div></body></html>"""
 
 def generate_logs_file(data):
     meta = data.get("meta",{}); logs = data.get("logs",[]); raw = data.get("raw",{}); auto = data.get("autoteka_hard",{})
     vin = meta.get("vin",""); reg = meta.get("reg",""); current = meta.get("current_gos","")
     all_gos = meta.get("all_gos_found",[])
-    txt = f"VIN: {vin} CURRENT: {current} REG: {reg}\nALL GOS: {all_gos}\nДата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\nBOOT: v65.8 CURRENT GOS\n\n=== ЛОГИ ===\n" + "\n".join(logs) + "\n\n"
+    txt = f"VIN: {vin} CURRENT: {current} REG: {reg}\nALL GOS: {all_gos}\nДата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\nBOOT: v66.1 CURRENT GOS\n\n=== ЛОГИ ===\n" + "\n".join(logs) + "\n\n"
     txt += f"model: {auto.get('model')} year: {auto.get('year')} owners: {auto.get('owners')} dtp: {auto.get('dtp_count')} current: {current} all_gos: {all_gos}\n"
     for src in ["vindecode","vindecode2","offerbyvin","eaisto","probeg2","gibdd","gai","gibddhistory","vin2number","servicemaintenance","zalog","dtp","osago","carsharing","taxi","pic_vin","pic_gos","autophoto","nomerogram"]:
         try:
@@ -1367,7 +1600,7 @@ async def cmd_start(m: types.Message):
     ud = get_user_data(m.from_user.id)
     ud["last_request"] = {"vin": None, "reg": None, "ts": 0}
     ud["last_report"] = {}
-    await m.answer("Привет! v65.8 • ТЕКУЩИЙ ГОС В КАРТОЧКУ 👇\n\n✅ Карточка по VIN, но текущий госномер = самый свежий:\n   1) vin2number 6₽ комм.базы (приоритет)\n   2) последний по дате из ТО eaisto\n   3) из объявлений / дилер ТО\n\n✅ Объявления = по ВСЕМ гос что находим (до 5 номеров)\n\nПришли VIN.", reply_markup=main_kb())
+    await m.answer("Привет! v66.1 • ТЕКУЩИЙ ГОС В КАРТОЧКУ 👇\n\n✅ Карточка по VIN, но текущий госномер = самый свежий:\n   1) vin2number 6₽ комм.базы (приоритет)\n   2) последний по дате из ТО eaisto\n   3) из объявлений / дилер ТО\n\n✅ Объявления = по ВСЕМ гос что находим (до 5 номеров)\n\nПришли VIN.", reply_markup=main_kb())
 
 @dp.message()
 async def handle(m: types.Message):
@@ -1424,19 +1657,19 @@ async def handle(m: types.Message):
         data = ud.get("last_report")
         if data and data.get("meta",{}).get("vin"):
             vin = data.get("meta",{}).get("vin")
-            await m.answer(f"🔄 Пересобираю v65.8 для {vin} из памяти...")
+            await m.answer(f"🔄 Пересобираю v66.1 для {vin} из памяти...")
             html_out = generate_history_html(f"{vin}_rebuild", data)
-            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin}_v65.8_REBUILD.html")
-            await m.answer_document(file, caption=f"🔄 v65.8 REBUILD {vin} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
+            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin}_v66.1_REBUILD.html")
+            await m.answer_document(file, caption=f"🔄 v66.1 REBUILD {vin} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
             return
         if vin_candidate:
-            await m.answer(f"🔄 Пересобираю v65.8 для {vin_candidate}...")
+            await m.answer(f"🔄 Пересобираю v66.1 для {vin_candidate}...")
             data = await check_history(vin_candidate, reg, user_id)
             ud["last_report"] = data
             ud["last_request"] = {"vin": vin_candidate, "reg": reg, "ts": now}
             html_out = generate_history_html(vin_candidate, data)
-            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v65.8.html")
-            await m.answer_document(file, caption=f"🔄 v65.8 {vin_candidate}", reply_markup=main_kb())
+            file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v66.1.html")
+            await m.answer_document(file, caption=f"🔄 v66.1 {vin_candidate}", reply_markup=main_kb())
             return
         await m.answer("Нет VIN в памяти.", reply_markup=main_kb())
         return
@@ -1444,8 +1677,8 @@ async def handle(m: types.Message):
     if "проверка у капота" in txt_low or txt_low.startswith("3️⃣"):
         await m.answer("3️⃣ Пришли 20 фото + видео. Сначала 1️⃣ чтобы я знал VIN.", reply_markup=main_kb())
         html_out = generate_kapot_html()
-        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"Kapot_v65.8.html")
-        await m.answer_document(file, caption="📋 Инструкция v65.8 CURRENT GOS", reply_markup=main_kb())
+        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"Kapot_v66.1.html")
+        await m.answer_document(file, caption="📋 Инструкция v66.1 CURRENT GOS", reply_markup=main_kb())
         return
 
     if "предварительные рекомендации" in txt_low or "рекомендации ии" in txt_low or txt_low.startswith("2️⃣"):
@@ -1468,7 +1701,7 @@ async def handle(m: types.Message):
                 ud["last_report"] = data_for_ai
                 ud["last_request"] = {"vin": vin_for_ai, "reg": reg, "ts": now}
                 html_hist = generate_history_html(vin_for_ai, data_for_ai)
-                file_hist = BufferedInputFile(html_hist.encode('utf-8'), filename=f"History_{vin_for_ai}_v65.8.html")
+                file_hist = BufferedInputFile(html_hist.encode('utf-8'), filename=f"History_{vin_for_ai}_v66.1.html")
                 await m.answer_document(file_hist, caption=f"1️⃣ История {vin_for_ai} • ТЕКУЩИЙ {data_for_ai.get('meta',{}).get('current_gos','')} • {len(data_for_ai.get('all_b64',[]))} фото", reply_markup=main_kb())
             except Exception as e:
                 log.exception("check_history failed")
@@ -1478,7 +1711,7 @@ async def handle(m: types.Message):
         prompt = build_prompt_for_openrouter(data_for_ai)
         ai_text, ai_error = await call_openrouter_ai(prompt)
         html_out = generate_ai_recommendations_html(data_for_ai, ai_text=ai_text, ai_error=ai_error)
-        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"AI_{vin_for_ai}_v65.8.html")
+        file = BufferedInputFile(html_out.encode('utf-8'), filename=f"AI_{vin_for_ai}_v66.1.html")
         caption = (ai_text[:800] + "..." if ai_text and len(ai_text)>800 else ai_text or f"Ошибка: {ai_error}")[:1000]
         await m.answer_document(file, caption=caption, reply_markup=main_kb())
         return
@@ -1490,8 +1723,8 @@ async def handle(m: types.Message):
             return
         vin = data.get("meta",{}).get("vin","unknown")
         logs_txt = generate_logs_file(data)
-        file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v65.8.txt")
-        await m.answer_document(file_logs, caption=f"📋 Логи v65.8 {vin} ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')}", reply_markup=main_kb())
+        file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin}_v66.1.txt")
+        await m.answer_document(file_logs, caption=f"📋 Логи v66.1 {vin} ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')}", reply_markup=main_kb())
         return
 
     if "проверка истории" in txt_low or txt_low.startswith("1️⃣") or vin_candidate:
@@ -1499,18 +1732,18 @@ async def handle(m: types.Message):
             if not is_valid_vin(vin_candidate):
                 await m.answer(f"VIN {vin_candidate} невалидный.", reply_markup=main_kb())
                 return
-            await m.answer(f"Принял VIN {vin_candidate} 👍 v65.8 ТЕКУЩИЙ ГОС В КАРТОЧКУ + объявления по всем гос ⏳")
+            await m.answer(f"Принял VIN {vin_candidate} 👍 v66.1 ТЕКУЩИЙ ГОС В КАРТОЧКУ + объявления по всем гос ⏳")
             await bot.send_chat_action(m.chat.id, "typing")
             try:
                 data = await check_history(vin_candidate, reg, user_id)
                 ud["last_report"] = data
                 ud["last_request"] = {"vin": vin_candidate, "reg": reg, "ts": now}
                 html_out = generate_history_html(vin_candidate, data)
-                file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v65.8.html")
-                await m.answer_document(file, caption=f"1️⃣ v65.8 {vin_candidate} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • ВСЕ ГОС: {','.join(data.get('meta',{}).get('all_gos_found',[])[:3])} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
+                file = BufferedInputFile(html_out.encode('utf-8'), filename=f"History_{vin_candidate}_v66.1.html")
+                await m.answer_document(file, caption=f"1️⃣ v66.1 {vin_candidate} • ТЕКУЩИЙ {data.get('meta',{}).get('current_gos','')} • ВСЕ ГОС: {','.join(data.get('meta',{}).get('all_gos_found',[])[:3])} • {len(data.get('all_b64',[]))} фото", reply_markup=main_kb())
                 try:
                     logs_txt = generate_logs_file(data)
-                    file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin_candidate}_v65.8.txt")
+                    file_logs = BufferedInputFile(logs_txt.encode('utf-8'), filename=f"LOGS_{vin_candidate}_v66.1.txt")
                     await m.answer_document(file_logs, caption=f"📋 Логи {vin_candidate}", reply_markup=main_kb())
                 except Exception as e:
                     await m.answer(f"⚠️ Логи: {e}")
@@ -1531,7 +1764,7 @@ async def handle(m: types.Message):
 async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook deleted, polling v65.8")
+        log.info("Webhook deleted, polling v66.1")
     except Exception as e:
         log.warning(f"delete_webhook {e}")
     try:
